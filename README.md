@@ -9,8 +9,9 @@ responder** en lugar de inventar.
 > Prueba técnica TopDevCrew · Ingeniero AI Full Stack Semi-Senior
 > Entrega antes del **5 de noviembre de 2026, 23:22 UTC**
 
-**Estado: Fase 0/6 completada** — esqueleto del monorepo, infraestructura Docker,
-esquema de datos con Alembic y CI. Ver [cronograma](#cronograma).
+**Estado: Fase 1/6 completada** — dominio puro (chunking por páginas, citas
+literales, umbral de rechazo) y configuración del stack real desde `.env`
+(D14), con 56 tests. Ver [cronograma](#cronograma).
 
 ## Stack
 
@@ -22,9 +23,14 @@ React + Vite · OpenTelemetry · Docker Compose
 Requisito: Docker.
 
 ```bash
-cp .env.example .env   # opcional: por defecto proveedores "fake" (sin claves ni red)
+cp .env.example .env   # y completa CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN
 docker compose up --build
 ```
+
+Por defecto el sistema arranca con el **proveedor real** (Cloudflare Workers
+AI, decisión D10). ¿Sin claves a mano? En `.env` pon `LLM_PROVIDER=fake` y
+`EMBEDDING_PROVIDER=fake`: todo corre con el proveedor simulado — es el modo
+con el que corren los tests (D14).
 
 | Servicio | URL / puerto |
 | --- | --- |
@@ -34,10 +40,26 @@ docker compose up --build
 | Collector OTel | 4317 (gRPC) / 4318 (HTTP) — trazas en consola |
 | Jaeger (opcional) | `docker compose --profile ui up` → http://localhost:16686 |
 
+## Verificar el stack: `make smoke`
+
+Los tests unitarios (56) los corre el CI en cada push; el smoke test comprueba lo
+que el CI no puede — **el stack arrancado de verdad**: servicios y healthchecks,
+`/health`, frontend, migración Alembic (tablas y enum de estados), pgvector con
+`vector(1024)` e índice HNSW, worker Celery vía Redis, el dominio de la Fase 1
+ejecutándose dentro del contenedor y la cadena `.env → compose → proceso` (D14).
+
+```bash
+make up      # levanta el stack
+make smoke   # 9 comprobaciones, PASS/FAIL por cada una
+```
+
+Si el stack se deployó desde Portainer con otro nombre de proyecto:
+`PROJECT_NAME=rag bash scripts/smoke_stack.sh`.
+
 ## Desarrollo sin Docker
 
 ```bash
-# Backend — los tests no usan red ni claves (proveedores fake)
+# Backend — la suite fija el modo fake por sí misma (tests sin red ni claves, D14)
 cd backend && pip install -r requirements.txt && pytest -q
 
 # Frontend
@@ -68,6 +90,34 @@ cd frontend && npm install && npm run dev
 - **Ver el error real de un paso de build** (sin que la barra de progreso lo
   tape): `docker compose build --progress=plain --no-cache frontend 2>&1 | tee build.log`
 
+- **El build falla en `pip install` con `Errno 101 Network is unreachable`.**
+  El paso de build (que corre dentro de un contenedor) no alcanza pypi.org,
+  aunque las imágenes se descarguen bien (eso lo hace el daemon en la red del
+  host). Diagnóstico en 30 segundos:
+
+  ```bash
+  # 1) ¿El host llega a PyPI?
+  curl -sI https://pypi.org/simple/ -o /dev/null -w '%{http_code}\n'
+
+  # 2) ¿Un contenedor llega a PyPI? (misma ruta de red que usa el build)
+  docker run --rm python:3.12-slim \
+    python -c "import urllib.request as u; print(u.urlopen('https://pypi.org/simple/', timeout=10).status)"
+  ```
+
+  Según el resultado:
+  - **Ambos funcionan** → fue una caída transitoria: reintenta
+    `docker compose up --build` (las capas anteriores están cacheadas).
+  - **Solo el contenedor falla** → típico tras conectar/desconectar una VPN o
+    un cambio de firewall que rompe el NAT del bridge de Docker:
+    `sudo systemctl restart docker` y reintentar. Si persiste, revisa qué IP
+    resuelve el contenedor (`docker run --rm python:3.12-slim python -c
+    "import socket; print(socket.gethostbyname('pypi.org'))"`); una IP tipo
+    `0.0.0.0` indica DNS filtrado (sinkhole corporativo).
+  - **El host tampoco llega** → la red bloquea PyPI. Dos salidas: configurar
+    el proxy corporativo en `~/.docker/config.json` (sección `proxies`;
+    BuildKit lo inyecta automáticamente en los builds), o apuntar a un espejo
+    accesible con la variable `PIP_INDEX_URL` en `.env` (ver `.env.example`).
+
 ## Estructura (monorepo)
 
 ```
@@ -92,7 +142,7 @@ La regla de dependencias es hexagonal: `domain` y `services` no importan nada de
 ## Cronograma
 
 - [x] **Fase 0** — Esqueleto monorepo, Docker Compose (6 servicios), modelos + Alembic, CI
-- [ ] **Fase 1** — Dominio puro: chunking, umbral de rechazo, citas + tests unitarios
+- [x] **Fase 1** — Dominio puro: chunking, umbral de rechazo, citas + tests unitarios
 - [ ] **Fase 2** — Ingesta asíncrona: puertos y adapters, Celery idempotente, retries
 - [ ] **Fase 3** — Consulta RAG: recuperación pgvector, puerto LLM (fake/OpenAI), rechazo
 - [ ] **Fase 4** — Frontend: subir y ver estado, preguntar, citas navegables
