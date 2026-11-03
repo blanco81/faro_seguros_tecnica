@@ -9,13 +9,14 @@ responder** en lugar de inventar.
 > Prueba técnica TopDevCrew · Ingeniero AI Full Stack Semi-Senior
 > Entrega antes del **5 de noviembre de 2026, 23:22 UTC**
 
-**Estado: Fase 2/6 completada** — Fase 0–1 (dominio puro, configuración D14) y
-Fase 2 cerrada de punta a punta: puertos y adapters de extracción/embeddings,
-repositorio y servicio de ingesta idempotente (D03), tarea Celery con contenido
-en la base (D15), política de reintentos (D16), API HTTP de subida y seguimiento
-con dispatch tras el commit (D17) y smoke end-to-end de la ingesta. 141 tests,
-14 comprobaciones de smoke. Siguiente: Fase 3 (consulta RAG). Ver
-[cronograma](#cronograma).
+**Estado: Fase 4/6 verificada** — Fase 0–3 (infra, dominio, ingesta asíncrona,
+consulta agéntica) y Fase 4 cerrada: **frontend React+Vite** con subida
+drag&drop, listado con polling 3s, consulta al agente con tres desenlaces
+(respuesta / rechazo / aclaración) y **citas navegables** — cada cita abre el
+PDF original en pestaña nueva con `#page=N` (D12). Endpoint nuevo
+`GET /api/documents/{id}/content` sirve el PDF `inline` y cacheable (D03).
+172 tests unitarios, 16 secciones de smoke. Siguiente: Fase 5 (observabilidad).
+Ver [cronograma](#cronograma).
 
 ## Stack
 
@@ -46,18 +47,21 @@ con el que corren los tests (D14).
 
 ## Verificar el stack: `make smoke`
 
-Los tests unitarios (141) los corre el CI en cada push; el smoke test comprueba lo
+Los tests unitarios (172) los corre el CI en cada push; el smoke test comprueba lo
 que el CI no puede — **el stack arrancado de verdad**: servicios y healthchecks,
-`/health`, frontend, migración Alembic (tablas y enum de estados), pgvector con
-`vector(1024)` e índice HNSW, worker Celery vía Redis, el dominio de la Fase 1
-ejecutándose dentro del contenedor, la cadena `.env → compose → proceso` (D14) y,
-desde la Fase 2, la **ingesta asíncrona completa**: subida por la API,
-procesamiento en el worker, chunks persistidos en pgvector e idempotencia de
-re-subida.
+`/health`, frontend (shell React con tabs + assets bundleados), migración
+Alembic (tablas y enum de estados), pgvector con `vector(1024)` e índice HNSW,
+worker Celery vía Redis, el dominio de la Fase 1 ejecutándose dentro del
+contenedor, la cadena `.env → compose → proceso` (D14), la **ingesta asíncrona
+completa** (subida por la API, procesamiento en el worker, chunks en pgvector,
+idempotencia de re-subida), la **consulta agéntica** (respuesta con cita literal
+verificada contra la base, rechazo explícito de preguntas fuera de dominio
+D13/D19) y, desde la Fase 4, el **frontend y la cita navegable**
+(`GET /api/documents/{id}/content` sirve el PDF inline y cacheable).
 
 ```bash
 make up      # levanta el stack
-make smoke   # 14 comprobaciones, PASS/FAIL por cada una
+make smoke   # 16 secciones / ~40 comprobaciones individuales, PASS/FAIL por cada una
 ```
 
 Si el stack se deployó desde Portainer con otro nombre de proyecto:
@@ -125,6 +129,18 @@ cd frontend && npm install && npm run dev
     BuildKit lo inyecta automáticamente en los builds), o apuntar a un espejo
     accesible con la variable `PIP_INDEX_URL` en `.env` (ver `.env.example`).
 
+- **La ingesta termina en `failed` con "Reintentos agotados (4 intentos):
+  Connection error." (máquinas con salida IPv6-only).** El worker no llega a
+  `api.cloudflare.com`: la red bridge de Docker es IPv4-interna y, sin salida
+  IPv4, el contenedor no resuelve el host (`[Errno -3] Temporary failure in
+  name resolution`). El `docker-compose.yml` del repo trae al `worker` en
+  `network_mode: host` (hereda la pila IPv6 del host) con `DATABASE_URL` y
+  `REDIS_URL` apuntando a `localhost` (los puertos 5432/6379 ya están
+  mapeados). En redes dual-stack es inofensivo. Si tu stack no levanta por
+  "mutually exclusive network_mode and networks", tienes un
+  `docker-compose.override.yml` reañadiendo `networks:` al worker: renómbralo
+  a `.bak` y vuelve a intentar.
+
 ## Estructura (monorepo)
 
 ```
@@ -151,8 +167,8 @@ La regla de dependencias es hexagonal: `domain` y `services` no importan nada de
 - [x] **Fase 0** — Esqueleto monorepo, Docker Compose (6 servicios), modelos + Alembic, CI
 - [x] **Fase 1** — Dominio puro: chunking, umbral de rechazo, citas + tests unitarios
 - [x] **Fase 2** — Ingesta asíncrona: puertos y adapters, Celery idempotente, retries, API de subida/seguimiento
-- [ ] **Fase 3** — Consulta RAG: recuperación pgvector, puerto LLM (fake/OpenAI), rechazo
-- [ ] **Fase 4** — Frontend: subir y ver estado, preguntar, citas navegables
+- [x] **Fase 3** — Consulta RAG agéntica: recuperación pgvector, bucle con verificación de citas (D19), rechazo explícito (D13) — **verificada con `make smoke` 37/37 OK, umbral calibrado en 0.45 (D20)**
+- [x] **Fase 4** — Frontend React+Vite: subida drag&drop, listado con polling 3s, consulta con tres desenlaces, citas navegables (`#page=N`, D12) — **verificada con `make smoke` (sección 16)**
 - [ ] **Fase 5** — Observabilidad end-to-end (HTTP → Celery → LLM) + seguridad
 - [ ] **Fase 6** — README completo, DECISIONS.md final, documentos y preguntas de evaluación
 

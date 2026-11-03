@@ -209,3 +209,43 @@ def get_document(
             detail=f"Documento no encontrado: {document_id}",
         )
     return document
+
+
+@documents_router.get("/{document_id}/content")
+def get_document_content(
+    document_id: uuid.UUID,
+    repository_uow: Callable[[], AbstractContextManager[DocumentRepository]] = Depends(
+        get_repository_uow
+    ),
+) -> Response:
+    """Devuelve el contenido crudo del documento (cita navegable, Fase 4).
+
+    El frontend abre esta ruta en pestaña nueva con ``#page=N`` y el
+    visor de PDF nativo del navegador salta a la página citada (D12). Por
+    eso se sirve ``inline`` y no ``attachment``: forzar descarga
+    inhabilitaría el visor y el ancla ``#page`` no tendría efecto.
+
+    El contenido es inmutable (D03 — mismo hash = mismos bytes), así que
+    se marca cacheable: reabrir la misma cita no recarga el PDF.
+
+    Status codes:
+
+    - ``200``: el contenido con el MIME original y ``Content-Disposition: inline``.
+    - ``404``: el documento no existe o se registró sin contenido.
+    """
+    with repository_uow() as repository:
+        document = repository.get(document_id)
+        data = repository.get_content(document_id) if document else None
+    if document is None or data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Documento sin contenido accesible: {document_id}",
+        )
+    return Response(
+        content=data,
+        media_type=document.mime_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{document.filename}"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )

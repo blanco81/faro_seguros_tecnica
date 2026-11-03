@@ -239,3 +239,69 @@ class TestSeguimiento:
         respuesta = client.get("/api/documents/no-es-un-uuid")
 
         assert respuesta.status_code == 422
+
+
+# --- GET /api/documents/{id}/content (Fase 4: cita navegable) ----------------
+
+
+class TestContenido:
+    """El endpoint que sirve el PDF original para que el frontend lo abra
+    con ``#page=N`` — sin él, la cita es solo texto y no es 'navegable'."""
+
+    def test_devuelve_los_bytes_con_mime_e_inline(self, cliente):
+        client = cliente()
+        # No es un PDF de verdad, pero el endpoint no parsea el contenido:
+        # lo guarda (D15) y lo devuelve tal cual. Lo que importa es el
+        # contrato HTTP (media_type, Content-Disposition, bytes idénticos).
+        pdf_bytes = b"%PDF-1.4\n%fake pero con bytes literales\n"
+        alta = _subir(
+            client,
+            nombre="poliza-ejemplo.pdf",
+            data=pdf_bytes,
+            mime="application/pdf",
+        )
+        document_id = alta.json()["id"]
+
+        r = client.get(f"/api/documents/{document_id}/content")
+
+        assert r.status_code == 200
+        assert r.content == pdf_bytes
+        assert r.headers["content-type"] == "application/pdf"
+        cd = r.headers["content-disposition"]
+        assert cd.startswith("inline"), f"esperaba inline, got: {cd}"
+        assert 'filename="poliza-ejemplo.pdf"' in cd
+
+    def test_marca_cacheable_porque_el_contenido_es_inmutable(self, cliente):
+        # D03: mismo hash = mismos bytes. Reabrir la misma cita no debe
+        # recargar el PDF del backend.
+        client = cliente()
+        alta = _subir(client, data=TEXTO_POLIZA.encode("utf-8"))
+        document_id = alta.json()["id"]
+
+        r = client.get(f"/api/documents/{document_id}/content")
+
+        assert r.status_code == 200
+        cc = r.headers.get("cache-control", "")
+        assert "public" in cc and "max-age" in cc, f"esperaba cacheable, got: {cc}"
+
+    def test_content_de_documento_inexistente_da_404(self, cliente):
+        client = cliente()
+
+        r = client.get(f"/api/documents/{uuid.uuid4()}/content")
+
+        assert r.status_code == 404
+
+    def test_content_no_colisiona_con_detalle_mismo_path(self, cliente):
+        # Sanity: /{id} devuelve JSON (DocumentOut), /{id}/content
+        # devuelve los bytes crudos. FastAPI debe enrutarlos por
+        # especificidad (dos segmentos vs uno).
+        client = cliente()
+        alta = _subir(client, data=TEXTO_POLIZA.encode("utf-8"))
+        document_id = alta.json()["id"]
+
+        detalle = client.get(f"/api/documents/{document_id}")
+        contenido = client.get(f"/api/documents/{document_id}/content")
+
+        assert detalle.headers["content-type"].startswith("application/json")
+        assert not contenido.headers["content-type"].startswith("application/json")
+        assert detalle.json()["id"] == document_id
