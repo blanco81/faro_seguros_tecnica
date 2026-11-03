@@ -9,9 +9,13 @@ responder** en lugar de inventar.
 > Prueba técnica TopDevCrew · Ingeniero AI Full Stack Semi-Senior
 > Entrega antes del **5 de noviembre de 2026, 23:22 UTC**
 
-**Estado: Fase 1/6 completada** — dominio puro (chunking por páginas, citas
-literales, umbral de rechazo) y configuración del stack real desde `.env`
-(D14), con 56 tests. Ver [cronograma](#cronograma).
+**Estado: Fase 2/6 completada** — Fase 0–1 (dominio puro, configuración D14) y
+Fase 2 cerrada de punta a punta: puertos y adapters de extracción/embeddings,
+repositorio y servicio de ingesta idempotente (D03), tarea Celery con contenido
+en la base (D15), política de reintentos (D16), API HTTP de subida y seguimiento
+con dispatch tras el commit (D17) y smoke end-to-end de la ingesta. 141 tests,
+14 comprobaciones de smoke. Siguiente: Fase 3 (consulta RAG). Ver
+[cronograma](#cronograma).
 
 ## Stack
 
@@ -42,15 +46,18 @@ con el que corren los tests (D14).
 
 ## Verificar el stack: `make smoke`
 
-Los tests unitarios (56) los corre el CI en cada push; el smoke test comprueba lo
+Los tests unitarios (141) los corre el CI en cada push; el smoke test comprueba lo
 que el CI no puede — **el stack arrancado de verdad**: servicios y healthchecks,
 `/health`, frontend, migración Alembic (tablas y enum de estados), pgvector con
 `vector(1024)` e índice HNSW, worker Celery vía Redis, el dominio de la Fase 1
-ejecutándose dentro del contenedor y la cadena `.env → compose → proceso` (D14).
+ejecutándose dentro del contenedor, la cadena `.env → compose → proceso` (D14) y,
+desde la Fase 2, la **ingesta asíncrona completa**: subida por la API,
+procesamiento en el worker, chunks persistidos en pgvector e idempotencia de
+re-subida.
 
 ```bash
 make up      # levanta el stack
-make smoke   # 9 comprobaciones, PASS/FAIL por cada una
+make smoke   # 14 comprobaciones, PASS/FAIL por cada una
 ```
 
 Si el stack se deployó desde Portainer con otro nombre de proyecto:
@@ -143,7 +150,7 @@ La regla de dependencias es hexagonal: `domain` y `services` no importan nada de
 
 - [x] **Fase 0** — Esqueleto monorepo, Docker Compose (6 servicios), modelos + Alembic, CI
 - [x] **Fase 1** — Dominio puro: chunking, umbral de rechazo, citas + tests unitarios
-- [ ] **Fase 2** — Ingesta asíncrona: puertos y adapters, Celery idempotente, retries
+- [x] **Fase 2** — Ingesta asíncrona: puertos y adapters, Celery idempotente, retries, API de subida/seguimiento
 - [ ] **Fase 3** — Consulta RAG: recuperación pgvector, puerto LLM (fake/OpenAI), rechazo
 - [ ] **Fase 4** — Frontend: subir y ver estado, preguntar, citas navegables
 - [ ] **Fase 5** — Observabilidad end-to-end (HTTP → Celery → LLM) + seguridad

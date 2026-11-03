@@ -1,12 +1,14 @@
 """Punto de entrada HTTP (adapter primario).
 
-Rutas de negocio bajo el prefijo /api (llegan en Fases 2 y 3);
-/health queda fuera para los healthchecks de Docker.
+``/health`` queda fuera del prefijo para los healthchecks de Docker; el
+negocio vive bajo ``/api`` — documentos (subida y seguimiento, Fase 2
+paso 4) y la consulta con citas (Fase 3).
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.adapters.http.documents import documents_router
 from app.config import get_settings
 
 
@@ -26,6 +28,9 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["infra"])
     def health() -> dict:
         return {"status": "ok"}
+
+    # Fase 2 paso 4: subida de documentos y seguimiento del estado.
+    app.include_router(documents_router)
 
     return app
 

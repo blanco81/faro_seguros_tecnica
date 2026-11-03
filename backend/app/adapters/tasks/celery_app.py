@@ -1,7 +1,16 @@
 """Aplicación Celery del worker.
 
-Las tareas reales de ingesta llegan en la Fase 2; por ahora existe para que el
-servicio del worker arranque y el healthcheck de compose sea válido.
+Tareas registradas (Fase 2 paso 3):
+
+- ``tasks.ping`` — sonda de vida para el healthcheck de compose.
+- ``tasks.ingest_document`` — pipeline de ingesta (importada vía
+  ``include`` cuando arranca el worker; así este módulo no depende de
+  los adapters de la tarea y no hay import circular).
+
+Configuración de entrega (D03/D16): ``task_acks_late`` + prefetch 1
+  — la tarea solo se saca de la cola al TERMINAR, de modo que un
+  reinicio del worker a mitad reentrega el mensaje (los reintentos
+  son seguros: run_ingestion es re-ejecutable).
 """
 
 from celery import Celery
@@ -14,6 +23,7 @@ celery_app = Celery(
     "faro_seguros",
     broker=settings.redis_url,
     backend=settings.redis_url,
+    include=["app.adapters.tasks.ingestion_task"],
 )
 
 celery_app.conf.update(

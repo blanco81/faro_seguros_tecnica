@@ -7,7 +7,7 @@ WORKDIR /code
 
 COPY requirements.txt .
 
-# Ahora pip resolverá pypi.org por IPv6 sin problemas
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
