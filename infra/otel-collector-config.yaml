@@ -1,0 +1,24 @@
+# Collector de OpenTelemetry: recibe OTLP de api y worker,
+# imprime las trazas en consola (exporter debug). Con --profile ui,
+# Jaeger consume OTLP en 4317/4318 y ofrece la UI en 16686.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
