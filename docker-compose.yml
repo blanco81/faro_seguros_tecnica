@@ -15,7 +15,7 @@ x-backend-env: &backend-env
   CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
   CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
   CLOUDFLARE_GATEWAY_ID: ${CLOUDFLARE_GATEWAY_ID:-}
-  REJECTION_THRESHOLD: ${REJECTION_THRESHOLD:-0.75}
+  REJECTION_THRESHOLD: ${REJECTION_THRESHOLD:-0.45}
   CHUNK_SIZE: ${CHUNK_SIZE:-800}
   CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
   MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
@@ -57,9 +57,20 @@ services:
     build: ./backend
     # Migraciones versionadas al arrancar (decisión D05 de DECISIONS.md)
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
-    environment: *backend-env
-    ports:
-      - "8000:8000"
+    # IPv6-only (mismo fix que el worker; ahora toca a la api por la consulta
+    # de la Fase 3): /api/query llama al LLM de Cloudflare desde ESTE proceso
+    # y en la bridge IPv4-interna no hay ruta IPv6 -> la consulta moriría en
+    # 503. network_mode: host hereda la pila del host. Consecuencias: uvicorn
+    # bindea el 8000 del host (el 'ports:' sobra y se quita), db/redis se
+    # alcanzan por los puertos ya mapeados, y el frontend proxifica vía
+    # host.docker.internal (extra_hosts en su servicio) porque 'api' ya no
+    # resuelve desde la bridge.
+    network_mode: host
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql+psycopg://faro:faro@localhost:5432/faro
+      REDIS_URL: redis://localhost:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
     depends_on:
       db:
         condition: service_healthy
@@ -71,8 +82,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
-    networks:
-      - intergraf_net
+
 
   worker:
     build: ./backend
@@ -83,9 +93,8 @@ services:
     # network_mode: host hace que el worker comparta la pila de red del host,
     # que SÍ llega a Cloudflare por IPv6 (mismo camino que el otro proyecto en
     # venv). db y redis exponen puertos al host (5432/6379), asi que desde el
-    # netns del host se alcanzan por localhost. La api se queda en la bridge:
-    # en Fase 2 no llama al proveedor (solo /health y /api/documents).
-    # (Fase 3: cuando la api consulte el LLM, repetir este patron para ella.)
+    # netns del host se alcanzan por localhost. (Fase 3: la api pasó a host
+    # por el mismo motivo — /api/query llama al LLM; ver su servicio.)
     network_mode: host
     environment:
       <<: *backend-env
@@ -107,6 +116,11 @@ services:
     build: ./frontend
     ports:
       - "5173:80"
+    # La api corre en la pila del host (IPv6-only): su nombre DNS ('api') no
+    # resuelve desde esta bridge. host-gateway apunta al host, donde uvicorn
+    # escucha en el 8000; nginx lo usa en proxy_pass.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       api:
         condition: service_healthy

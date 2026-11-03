@@ -19,8 +19,9 @@ test:
 lint:
 	cd backend && ruff check app tests
 
-# Smoke test del stack LEVANTADO: 9 comprobaciones del sistema real
+# Smoke test del stack LEVANTADO: 15 comprobaciones del sistema real
 # (servicios, healthchecks, migración, pgvector+HNSW, Celery, dominio,
-# config viva). Ver scripts/smoke_stack.sh
+# config viva, ingesta asíncrona end-to-end y consulta agéntica con
+# cita verificada). Ver scripts/smoke_stack.sh
 smoke:
 	bash scripts/smoke_stack.sh
