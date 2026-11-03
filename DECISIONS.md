@@ -139,6 +139,110 @@ la demo; queda soportado como segundo preset). bge-base-en-v1.5 de Cloudflare
 OpenAI-compatible ya da lo necesario). Modelos locales tipo Ollama (latencia y
 setup en la máquina del evaluador).
 
+## D11 — Chunking por página con solapamiento intra-página
+
+**Contexto.** El enunciado pide chunking con solapamiento y citas verificables
+a nivel de página.
+
+**Decisión.** `app/domain/chunker.py` corta el texto **página por página**:
+un chunk nunca cruza el límite de una página. Dentro de cada página se
+empaquetan palabras enteras hasta `chunk_size` (800 caracteres por defecto)
+y cada chunk nuevo arranca con las últimas palabras del anterior que quepan
+en el presupuesto `chunk_overlap` (120). El texto se normaliza a espacios
+simples (la extracción de PDF mete saltos de línea arbitrarios). Los
+`page_number` se validan (≥ 1), las páginas en blanco no producen chunks y
+los ordinales son globales y secuenciales. Único caso patológico permitido:
+una palabra individual más larga que `chunk_size` se emite como chunk propio
+(partirla rompería la literalidad de las citas).
+
+**Por qué.** La cita es "documento + página + fragmento": si un chunk
+cruzara dos páginas, la página citada sería ambigua y dejaría de poder
+verificarse con un ctrl+F. Palabras enteras, nunca cortes a mitad de
+palabra, por la misma razón de literalidad.
+
+**Alternativas descartadas.** Chunking global ignorando páginas (citas
+ambiguas). Particionar por oraciones (una cláusula de póliza puede superar
+los 800 caracteres y el particionado se vuelve impredecible).
+`RecursiveCharacterTextSplitter` de LangChain (misma lógica pero añade una
+dependencia al núcleo, que debe quedar puro y sin frameworks).
+
+## D12 — Citas literales: el fragmento es un substring exacto del chunk
+
+**Contexto.** "Citas verificables" debe significar algo comprobable
+mecánicamente, no una promesa.
+
+**Decisión.** `app/domain/citations.py` construye cada cita con nombre de
+documento, página (1-indexada) y un fragmento **literal** del contenido del
+chunk almacenado: nunca paráfrasis, nunca reescritura del LLM. Si el chunk
+supera el máximo (220 caracteres por defecto), se recorta por palabra
+completa, pero lo citado sigue siendo un substring exacto. El contrato está
+expresado como código (`quote_is_verbatim`) y los tests lo fijan. Los puntos
+suspensivos de presentación los añade la UI al renderizar; el dominio los
+omite para no romper el substring.
+
+**Por qué.** Verificable = el evaluador abre el documento, va a la página
+citada y encuentra ese texto. Cualquier transformación del fragmento rompe
+esa promesa.
+
+## D13 — Umbral de rechazo: todo-o-nada sobre el mejor resultado
+
+**Contexto.** El enunciado exige que el sistema se niegue a responder cuando
+la evidencia recuperada no alcanza un umbral de similitud definido.
+
+**Decisión.** `app/domain/retrieval.py` responde solo si el chunk con MAYOR
+similitud coseno alcanza el umbral (inclusivo). Si lo alcanza, responde con
+los `top_k` mejores; si no, rechaza de forma explícita con un mensaje fijo
+(`REJECTION_MESSAGE`) y **sin entregar contextos débiles** — nunca responde
+"con lo que haya". Sin resultados también se rechaza (razón distinta).
+La similitud llega ya convertida por el adapter: pgvector devuelve distancia
+coseno y el dominio recibe `1 − distancia`.
+
+El umbral por defecto es **0.45**: bge-m3 rara vez supera ~0.7 incluso con
+paráfrasis, así que el 0.75 inicial habría rechazado casi todo. Es un punto
+de partida razonado que se calibrará empíricamente con el set de evaluación
+de la Fase 3.
+
+**Alternativas descartadas.** Filtrar chunk a chunk por el umbral (permitiría
+responder apoyado solo en resultados débiles). Responder siempre y dejar que
+el LLM decida (el enunciado exige el rechazo del sistema, no del modelo).
+Umbral doble mínimo+máximo (más perillas sin evidencia de que ayuden).
+
+## D14 — Configuración: stack real por defecto, modo fake explícito
+
+**Contexto.** El enunciado exige probar la ingesta y la consulta con un
+proveedor simulado sin claves, pero el proyecto ya definió su proveedor real
+(D10). Se pidió eliminar los valores "fake" como defecto y que toda la
+configuración viva en `.env`.
+
+**Decisión.** Los defaults de `app/config.py` y de `docker-compose.yml` son
+el stack real: Cloudflare Workers AI con `@cf/meta/llama-3.3-70b-instruct-
+fp8-fast` (chat) y `@cf/baai/bge-m3` (embeddings). `.env.example` es la
+plantilla real: solo faltan por llenar `CLOUDFLARE_ACCOUNT_ID` y
+`CLOUDFLARE_API_TOKEN`. El modo fake NO desaparece —el enunciado lo exige—
+pero deja de ser el valor por defecto: lo fijan explícitamente los tests
+(`tests/conftest.py` fija `LLM_PROVIDER`/`EMBEDDING_PROVIDER`) o quien quiera
+correr sin claves.
+
+Precedencia (pydantic-settings): variable de entorno > `.env` > default —
+los valores literales de `config.py` son SOLO fallback (lo fijan tests
+parametrizados). El `.env` se resuelve anclado a la raíz del repo
+(`ENV_FILE = REPO_ROOT / ".env"`), independiente del directorio desde donde
+se lance uvicorn/alembic/celery/pytest (antes era relativo al CWD y un
+`.env` de la raíz quedaba ignorado al lanzar desde `backend/`); si no existe
+(contenedores), se ignora porque compose inyecta las variables reales. Los
+nombres de proveedor son un `Literal`: un typo falla al arrancar con el
+listado de valores válidos. `validate_provider_credentials()` verifica las
+credenciales del proveedor elegido con fail-fast y mensaje accionable; la
+conecta el factory de adapters al arrancar (Fase 2).
+
+**Alternativas descartadas.** `extra="allow"` para cargar cualquier variable
+del `.env` sin declararla: pydantic-settings absorbería TODO el entorno del
+proceso (PATH incluida) y `model_dump()` volcaría secretos a logs y trazas;
+las variables se declaran tipadas — una línea, validación gratis. Mantener
+fake como default (la demo arrancaría en modo simulado sin que nadie lo
+note). Silent-fallback a fake si faltan credenciales (enmascara la
+misconfiguración; mejor morir con mensaje claro).
+
 ## Uso de IA generativa
 
 Metodología: análisis del enunciado y planificación con IA; generación asistida
