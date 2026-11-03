@@ -10,6 +10,8 @@ x-backend-env: &backend-env
   OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
   LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+  EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+  EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
   CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
   CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
   CLOUDFLARE_GATEWAY_ID: ${CLOUDFLARE_GATEWAY_ID:-}
@@ -75,7 +77,20 @@ services:
   worker:
     build: ./backend
     command: celery -A app.adapters.tasks.celery_app worker --loglevel=INFO --concurrency=2
-    environment: *backend-env
+    # FIX IPv6-only: esta maquina solo sale a internet por IPv6. La red bridge
+    # de Docker es IPv4-interna y el contenedor no tiene ruta IPv6 -> no puede
+    # resolver (ni conectar a) api.cloudflare.com -> [Errno -3] al embedizar.
+    # network_mode: host hace que el worker comparta la pila de red del host,
+    # que SÍ llega a Cloudflare por IPv6 (mismo camino que el otro proyecto en
+    # venv). db y redis exponen puertos al host (5432/6379), asi que desde el
+    # netns del host se alcanzan por localhost. La api se queda en la bridge:
+    # en Fase 2 no llama al proveedor (solo /health y /api/documents).
+    # (Fase 3: cuando la api consulte el LLM, repetir este patron para ella.)
+    network_mode: host
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql+psycopg://faro:faro@localhost:5432/faro
+      REDIS_URL: redis://localhost:6379/0
     depends_on:
       db:
         condition: service_healthy
@@ -87,8 +102,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
-    networks:
-      - intergraf_net
 
   frontend:
     build: ./frontend

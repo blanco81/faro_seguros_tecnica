@@ -141,13 +141,21 @@ def test_fake_no_exige_credenciales():
 
 def test_models_metadata_complete():
     tables = Base.metadata.tables
-    assert set(tables) == {"documents", "chunks"}
+    assert set(tables) == {"documents", "chunks", "document_contents"}
     assert EMBEDDING_DIMS == 1024  # @cf/baai/bge-m3 (decisión D10)
     assert "content_hash" in tables["documents"].columns
     assert "embedding" in tables["chunks"].columns
     # La FK con borrado en cascada sostiene la idempotencia del reproceso
     fk = next(iter(tables["chunks"].foreign_keys))
     assert fk.ondelete == "CASCADE"
+    # D15: contenido crudo en tabla 1:1 aparte — PK = FK con CASCADE
+    # (muere con el documento) y columna binaria, sin tocar documents.
+    contenido = tables["document_contents"]
+    assert set(contenido.columns.keys()) == {"document_id", "data"}
+    assert contenido.primary_key.columns.keys() == ["document_id"]
+    fk_contenido = next(iter(contenido.foreign_keys))
+    assert fk_contenido.column.table.name == "documents"
+    assert fk_contenido.ondelete == "CASCADE"
 
 
 def test_cloudflare_base_url_requires_account_id():

@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     llm_model: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
     embedding_model: str = "@cf/baai/bge-m3"
     llm_timeout_seconds: float = 30.0
+    # Fase 2 (ingesta): lotes y plazo de las llamadas de embeddings.
+    # Los proveedores limitan cuántos textos aceptan por llamada; 32 es un
+    # tamaño seguro para el endpoint OpenAI-compatible de Workers AI.
+    embedding_batch_size: int = 32
+    embedding_timeout_seconds: float = 30.0
 
     # --- Cloudflare Workers AI (endpoint OpenAI-compatible, D10) ---
     cloudflare_account_id: str | None = None

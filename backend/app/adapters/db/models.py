@@ -7,16 +7,13 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.domain.document import DocumentStatus
-
-#: Dimensión fija de los embeddings (@cf/baai/bge-m3 en Workers AI, decision D10).
-#: Multilingüe (español incluido). Cambiarla exige una migración explícita (D02).
-EMBEDDING_DIMS = 1024
+from app.ports.embeddings import EMBEDDING_DIMS
 
 
 class Base(DeclarativeBase):
@@ -25,7 +22,6 @@ class Base(DeclarativeBase):
 
 class Document(Base):
     __tablename__ = "documents"
-
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
@@ -70,3 +66,19 @@ class Chunk(Base):
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIMS))
 
     document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class DocumentContent(Base):
+    """Contenido crudo del archivo subido (D15): tabla 1:1 aparte.
+
+    La tarea Celery solo recibe el ``document_id`` y lee los bytes de
+    aquí; así el reintento/reproceso (D04) no exige re-subir el archivo
+    y ``documents`` queda libre del blob en todas sus lecturas.
+    """
+
+    __tablename__ = "document_contents"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    data: Mapped[bytes] = mapped_column(LargeBinary)

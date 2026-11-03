@@ -243,6 +243,104 @@ fake como default (la demo arrancaría en modo simulado sin que nadie lo
 note). Silent-fallback a fake si faltan credenciales (enmascara la
 misconfiguración; mejor morir con mensaje claro).
 
+## D15 — El contenido del documento viaja por la base, no por el broker
+
+**Contexto.** La tarea Celery de ingesta necesita los bytes del archivo
+para extraer texto y embedizar, y el límite de subida es 20 MB (D08).
+
+**Decisión.** Tabla `document_contents` 1:1 (PK = FK con `ON DELETE
+CASCADE`, migración 0002), en el puerto `DocumentRepository` como
+`save_content`/`get_content`. `register_document` escribe documento y
+contenido en la MISMA transacción: o queda el registro completo, o no
+queda nada. La tarea recibe solo el `document_id` y lee los bytes del
+repositorio.
+
+**Por qué.** Un reintento de Celery, una reentrega tras reiniciar el
+worker (`acks_late`) o un reproceso manual (D04) arrancan siempre de lo
+mismo — "dime qué documento" — sin exigir re-subir el archivo. El
+mensaje de la tarea mide unos bytes (un UUID), no ~27 MB de base64
+atravesando Redis en cada reintento. Y el original queda disponible
+para que la Fase 4 lo sirva al navegador y el evaluador verifique la
+cita contra el documento real (D12).
+
+**Alternativas descartadas.** Bytes en el payload de la tarea (el
+anti-patrón clásico de Celery: Redis es memoria; con `acks_late` el
+mensaje se retiene y se reenvía). Volumen compartido api↔worker (acopla
+el despliegue a un solo host y exige limpiar huérfanos). BYTEA dentro
+de `documents` (TOAST lo soporta, pero cualquier `SELECT *` del agregado
+arrastraría el blob; la tabla aparte lo deja fuera de cada lectura).
+
+## D16 — Reintentos: la tarea clasifica, el servicio solo marca
+
+**Contexto.** Ingesta asíncrona con reintentos: ¿qué se reintenta, cuántas
+veces y quién decide cuándo un fallo es definitivo?
+
+**Decisión.** La política vive en la TAREA (`decide_retry`, función pura
+en `adapters/tasks/ingestion_task.py`) y clasifica por tipo de
+excepción:
+
+- **Fatal** (`FatalIngestionError`, la lanza `run_ingestion` ya habiendo
+  marcado el documento `failed`): la tarea termina SIN reintentar — un
+  PDF cifrado sigue cifrado tras mil reintentos.
+- **Transitoria** (red, base, timeouts del proveedor,
+  `SoftTimeLimitExceeded`): hasta 3 reintentos con backoff exponencial
+  (10/20/40 s); el documento queda `processing` entre intentos, que es
+  la verdad.
+- **Presupuesto agotado**: la TAREA marca `failed` con la razón
+  ("Reintentos agotados (4 intentos): …") desde una sesión nueva — la
+  del último intento pudo morir con la propia base caída.
+
+Transaccionalidad que lo sostiene: el `failed` de negocio COMPLETA la
+transacción (`session_scope(commit_on=FatalIngestionError)`), porque ese
+fallo ES el resultado correcto de la tarea; las transitorias revierten
+(sin estado parcial, D03). El `max_retries` del decorador duplica el
+techo de la política como red de seguridad ante refactorizaciones.
+
+**Alternativas descartadas.** `autoretry_for` + `retry_backoff` de Celery
+(reintenta TODO, incluidas las fatales: cuatro intentos de un PDF
+cifrado; y la política dejaría de ser código visible y testable).
+Marcar `failed` desde el servicio ante cualquier excepción (la primera
+transitoria mataría el reintento que la iba a curar). No marcar nunca
+(un documento que agotó reintentos quedaría `processing` para siempre).
+
+## D17 — La API despacha la tarea DESPUÉS del commit
+
+**Contexto.** El endpoint de subida (Fase 2 paso 4) debe encolar
+`tasks.ingest_document` solo cuando el documento ya es visible para el
+worker. La solución "natural" de FastAPI —despachar en una
+`BackgroundTask`— tiene una trampa de orden que se verificó empíricamente
+en FastAPI 0.128: las background tasks corren ANTES del código de salida
+de las dependencias con `yield`, así que el commit de la sesión llegaría
+tarde. El worker levantaría la tarea sin ver la fila, la clasificaría como
+fatal ("el documento no existe") y —siendo fatal— no se reintenta: el
+documento quedaría `pending` para siempre.
+
+**Decisión.** El endpoint abre su propia unidad de trabajo con `with`
+(el mismo `session_scope` del worker, expuesto como dependencia
+inyectable `get_repository_uow`) y despacha la tarea AL SALIR del bloque,
+con documento y contenido (D15) ya commiteados. La regla hexagonal se
+mantiene: la ruta solo conoce el puerto `DocumentRepository`; el adapter
+ORM vive en la pieza de composición. El dispatcher también es inyectable
+(`get_ingest_dispatcher`, import lazy de la tarea) para que la suite
+pruebe el contrato HTTP sin broker.
+
+Contrato de la subida: `201` + `Location` para documento nuevo (tarea
+despachada); `200` para re-subida del mismo contenido (D03: sin tarea
+nueva, se devuelve el estado que YA tiene). Validaciones D08 antes de
+tocar negocio: `415` MIME no permitido, `413` tamaño, `422` nombre vacío
+o archivo vacío. Seguimiento: `GET /api/documents` (listado) y
+`GET /api/documents/{id}` (estado, páginas, chunks, motivo de fallo).
+
+**Alternativas descartadas.** `BackgroundTasks` (orden verificado:
+dispatch antes del commit — la carrera descrita arriba). Despachar dentro
+de la transacción (misma carrera, sin necesidad de background task).
+`countdown` artificial en la tarea (esperar "un poquito" no es una
+garantía). Commit explícito dentro del endpoint accediendo a la sesión
+de la dependencia (rompe la encapsulación del puerto). Ruff: se añade
+`backend/ruff.toml` ignorando B008, el falso positivo canónico del
+idioma `Depends(...)` de FastAPI (en defaults de ruff desde 0.17, que es
+lo que instala el CI con su pin `ruff>=0.8`).
+
 ## Uso de IA generativa
 
 Metodología: análisis del enunciado y planificación con IA; generación asistida

@@ -1,0 +1,10 @@
+# Configuración de ruff — la que usan `make lint` y el CI
+# (`ruff check app tests` desde backend/).
+#
+# B008 ("llamada a función en defaults") es el idioma OFICIAL de FastAPI
+# para inyectar dependencias: `def ruta(repo = Depends(get_repo))` no se
+# puede escribir sin la llamada en el default. Es la excepción estándar
+# que todo proyecto FastAPI añade a ruff/flake8. Los defaults de ruff
+# incluyen bugbear (B) desde la 0.17, y el CI instala ruff>=0.8 flotante.
+[lint]
+ignore = ["B008"]
