@@ -1,0 +1,335 @@
+/* Faro Seguros RAG — tema "asegurador sobrio" (Fase 4)
+ *
+ * Paleta basada en azul marino (#0F2A4A) con grises neutros para fondo
+ * y texto. Densidad fintech: padding compacto, tablas densas, bordes 1px.
+ * Sin framework CSS: variables + selectores planos. El objetivo es que
+ * la UI parezca una herramienta interna de una aseguradora, no un SaaS
+ * de consumo.
+ */
+
+:root {
+  --azul-marino: #0f2a4a;
+  --azul-medio: #1e5a8c;
+  --azul-claro: #e8eef5;
+  --gris-fondo: #f7f8fa;
+  --gris-borde: #e5e7eb;
+  --texto: #1f2937;
+  --texto-sec: #6b7280;
+  --blanco: #ffffff;
+
+  /* estados del documento (D04) */
+  --st-pending: #6b7280;
+  --st-processing: #d97706;
+  --st-ready: #059669;
+  --st-failed: #dc2626;
+
+  --radio: 4px;
+  --sombra: 0 1px 2px rgba(15, 42, 74, 0.06);
+  --sombra-media: 0 4px 12px rgba(15, 42, 74, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--gris-fondo);
+  color: var(--texto);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a { color: var(--azul-medio); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* --- layout principal --- */
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+}
+
+.app-header {
+  border-bottom: 2px solid var(--azul-marino);
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+}
+.app-header h1 {
+  margin: 0;
+  color: var(--azul-marino);
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.app-header .sub {
+  color: var(--texto-sec);
+  font-size: 0.85rem;
+  margin-top: 0.25rem;
+}
+
+/* --- tabs --- */
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--gris-borde);
+  margin-bottom: 1.5rem;
+}
+.tab {
+  padding: 0.7rem 1.25rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--texto-sec);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-family: inherit;
+  font-weight: 500;
+  transition: color 0.1s, border-color 0.1s;
+}
+.tab:hover { color: var(--azul-marino); }
+.tab.activa {
+  color: var(--azul-marino);
+  border-bottom-color: var(--azul-marino);
+}
+
+/* --- panel genérico --- */
+.panel {
+  background: var(--blanco);
+  border: 1px solid var(--gris-borde);
+  border-radius: var(--radio);
+  box-shadow: var(--sombra);
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+.panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  color: var(--azul-marino);
+  font-weight: 600;
+}
+
+/* --- drag&drop --- */
+/* display:block es LA corrección clave: un <label> es inline por defecto y
+   aquí contiene <div> en bloque; el navegador fragmenta su caja anónima y el
+   borde punteado + fondo colapsaban en una franja vertical de ~17px que se
+   solapaba al h2 tapando el inicio del título ("Subir" quedaba invisible). */
+.dropzone {
+  display: block;
+  border: 2px dashed var(--gris-borde);
+  border-radius: var(--radio);
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--texto-sec);
+  cursor: pointer;
+  transition: all 0.15s;
+  background: var(--gris-fondo);
+}
+.dropzone:hover {
+  border-color: var(--azul-medio);
+  color: var(--azul-medio);
+}
+.dropzone.dragging {
+  border-color: var(--azul-marino);
+  background: var(--azul-claro);
+  color: var(--azul-marino);
+}
+.dropzone .icono {
+  font-size: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+.dropzone input[type=file] { display: none; }
+
+/* --- tabla de documentos --- */
+.tabla-docs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.tabla-docs th {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--gris-borde);
+  color: var(--texto-sec);
+  font-weight: 500;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tabla-docs td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--gris-borde);
+  vertical-align: middle;
+}
+/* columnas numéricas (Págs., Chunks, Tamaño) alineadas a la derecha
+   para que magnitudes comparables se lean en columna */
+.tabla-docs th:nth-child(3),
+.tabla-docs td:nth-child(3),
+.tabla-docs th:nth-child(4),
+.tabla-docs td:nth-child(4),
+.tabla-docs th:nth-child(5),
+.tabla-docs td:nth-child(5) {
+  text-align: right;
+}
+.tabla-docs tr:hover td { background: var(--gris-fondo); }
+.tabla-docs .filename { color: var(--azul-marino); font-weight: 500; }
+
+/* --- badge de estado --- */
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--blanco);
+}
+.badge.pending { background: var(--st-pending); }
+.badge.processing { background: var(--st-processing); }
+.badge.ready { background: var(--st-ready); }
+.badge.failed { background: var(--st-failed); }
+
+/* --- botones --- */
+.btn {
+  padding: 0.55rem 1.1rem;
+  border-radius: var(--radio);
+  border: 1px solid var(--azul-marino);
+  background: var(--azul-marino);
+  color: var(--blanco);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: background 0.1s;
+}
+.btn:hover:not(:disabled) { background: var(--azul-medio); border-color: var(--azul-medio); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.secundario {
+  background: var(--blanco);
+  color: var(--azul-marino);
+}
+.btn.secundario:hover:not(:disabled) {
+  background: var(--azul-claro);
+}
+
+/* --- formulario de consulta --- */
+.consulta-input {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--gris-borde);
+  border-radius: var(--radio);
+  font-family: inherit;
+  font-size: 0.9rem;
+  resize: vertical;
+  min-height: 80px;
+}
+.consulta-input:focus {
+  outline: none;
+  border-color: var(--azul-medio);
+  box-shadow: 0 0 0 3px var(--azul-claro);
+}
+
+.select-doc {
+  padding: 0.5rem;
+  border: 1px solid var(--gris-borde);
+  border-radius: var(--radio);
+  font-family: inherit;
+  font-size: 0.85rem;
+  background: var(--blanco);
+  color: var(--texto);
+  max-width: 320px;
+}
+
+.fila-form {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0.5rem 0 1rem;
+}
+
+/* --- panel de respuesta --- */
+.respuesta {
+  padding: 1rem 1.25rem;
+  border-left: 3px solid var(--azul-marino);
+  background: var(--azul-claro);
+  border-radius: 0 var(--radio) var(--radio) 0;
+  margin: 0.75rem 0;
+}
+.respuesta.rec refuse, .respuesta.refused {
+  border-left-color: var(--st-failed);
+  background: #fef2f2;
+}
+.respuesta.clarification {
+  border-left-color: var(--st-processing);
+  background: #fffbeb;
+}
+.respuesta .label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--texto-sec);
+  font-weight: 600;
+}
+.respuesta .texto { margin-top: 0.25rem; }
+
+/* --- cita navegable --- */
+.cita {
+  background: var(--gris-fondo);
+  border: 1px solid var(--gris-borde);
+  border-radius: var(--radio);
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+}
+.cita .meta {
+  font-size: 0.75rem;
+  color: var(--texto-sec);
+  margin-bottom: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.cita .meta a {
+  font-weight: 500;
+}
+.cita .meta .separador { color: var(--gris-borde); }
+.cita blockquote {
+  margin: 0;
+  padding: 0;
+  border: none;
+  font-style: italic;
+  color: var(--texto);
+  font-size: 0.85rem;
+}
+.cita .pag-link::after { content: " ↗"; }
+
+/* --- estados varios --- */
+.vacio {
+  color: var(--texto-sec);
+  font-style: italic;
+  padding: 1.5rem;
+  text-align: center;
+}
+.error-msg {
+  color: var(--st-failed);
+  font-size: 0.85rem;
+  padding: 0.5rem 0.75rem;
+  background: #fef2f2;
+  border-radius: var(--radio);
+  margin: 0.5rem 0;
+}
+.cargando {
+  color: var(--texto-sec);
+  font-size: 0.85rem;
+  font-style: italic;
+}
+.iteraciones {
+  font-size: 0.75rem;
+  color: var(--texto-sec);
+  margin-top: 0.5rem;
+}
+.footer-status {
+  font-size: 0.75rem;
+  color: var(--texto-sec);
+  margin-top: 0.5rem;
+}

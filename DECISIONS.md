@@ -341,6 +341,177 @@ de la dependencia (rompe la encapsulación del puerto). Ruff: se añade
 idioma `Depends(...)` de FastAPI (en defaults de ruff desde 0.17, que es
 lo que instala el CI con su pin `ruff>=0.8`).
 
+## D18 — El 413 del smoke se omite (lo cubre la suite unitaria)
+
+**Contexto.** El smoke de la Fase 2 (sección 14) valida los rechazos de
+subida D08 que aportan señal nueva sobre el stack real: 415 (MIME no
+permitido), 422 (archivo vacío), 422 (sin nombre). El 413 (tamaño >
+`MAX_UPLOAD_MB`) no se ejercita porque fabricar un archivo de >20 MB en
+cada corrida —para ver un HTTP que la suite unitaria ya cubre— es
+despilfarro de I/O y bytes temporales.
+
+**Decisión.** El 413 se cubre en `tests/test_api_documents.py`; el smoke
+lo omite con un comentario apuntando aquí. El contrato (código + mensaje)
+es el mismo sin importar quién lo dispare; lo que el smoke sí aporta
+(servidor real, multipart real, estado en la base) ya está cubierto por
+los otros tres rechazos de la sección 14.
+
+**Alternativas descartadas.** Generar un payload grande con `fallocate`
+en el smoke (lento, escribe basura al disco en cada run). Subir un PDF
+grande commiteado (pesa en el repo para siempre). Bajar `MAX_UPLOAD_MB` a
+1 MB en el smoke para forzar el 413 con un archivo chico (cambia la
+configuración del sistema bajo prueba — el smoke debe probar el sistema
+real, no una versión capada).
+
+## D19 — Consulta agéntica con verificación iterativa de citas
+
+**Contexto.** El enunciado exige RAG con citas verificables y rechazo
+cuando la evidencia no alcanza (D13). Un RAG plano (retrieve → generate
+en un solo pase) cumple la letra pero falla en los casos que distinguen
+a un asistente útil para un analista de siniestros: (a) preguntas
+multi-documento/multi-paso (un siniestro toca póliza + anexo + carta),
+donde una sola recuperación no trae todo lo necesario; (b) fidelidad de
+la cita — el LLM puede parafrasear y atribuir mal el fragmento; (c) el
+umbral de rechazo (D13) se evalúa una sola vez, sin oportunidad de
+refinar la consulta. La programación agéntica (requisito orientado de
+último momento) encaja como evolución natural de la Fase 3, no como
+pegote: convierte los pasos single-shot en un bucle con verificación.
+
+**Decisión.** La Fase 3 se implementa como un **servicio agéntico
+acotado** — `AgenticQueryService` — que orquesta los puertos existentes
+(`LLMProvider`, `DocumentRepository`) más un nuevo `RetrievalPort`
+(búsqueda pgvector, top-k por similitud coseno sobre `chunks.embedding`).
+Bucle: **planificar** (¿la pregunta necesita descomposición en
+sub-preguntas?) → **recuperar** (top-k chunks, umbral D13) → **generar**
+respuesta con cita literal → **verificar** (el fragmento citado aparece
+verbatim en un chunk recuperado) → si no cuadra o la evidencia es
+insuficiente, **refinar** la consulta y **reintentar**, con **techo**
+(máx `MAX_QUERY_ITERATIONS = 3`) → **responder | rehusar | pedir
+aclaración**. El agente decide, itera y verifica; sin descomponerse en
+múltiples agentes. Detalle de implementación (puertos, tests, umbral de
+parada, plan paso a paso) en el documento de diseño `Fase_3_Diseno_Agenticо`.
+
+**Alternativas descartadas (no para siempre, "no ahora").** Multi-agente
+LangGraph (router → retriever → synthesizer → verifier → compliance):
+claridad arquitectónica, pero infraestructura pesada (graph state, nodos,
+edges) desproporcionada para un MVP con el plazo de entrega actual; cada
+nodo sería un envoltorio fino sobre el mismo puerto. Agente tool-using
+con tools dinámicas (`search_chunks`, `get_document`, `compare_clauses`):
+potente pero token-heavy, latencia alta, y la superficie de tools añade
+complejidad de testing sin valor visible al analista en esta fase.
+Conversacional multi-turno con memoria: cambia el contrato del enunciado
+(pregunta-respuesta) y el alcance de la Fase 4. Estas tres quedan como
+roadmap documentado.
+
+## D20 — Umbral de rechazo confirmado en 0.45 (calibración verificada end-to-end)
+
+**Contexto.** D13 dejó `REJECTION_THRESHOLD = 0.45` como "punto de partida
+razonado" pendiente de calibración con el set de evaluación de la Fase 3.
+La Fase 3 ya está implementada (D19) y el smoke end-to-end
+(`scripts/smoke_stack.sh`, sección 15) es el primer set real de
+comprobaciones que ejercita el pipeline completo con proveedor real
+(Cloudflare Workers AI: `@cf/baai/bge-m3` para embeddings y
+`@cf/meta/llama-3.3-70b-instruct-fp8-fast` para chat) sobre un documento
+ingestado de verdad (`poliza-ejemplo.pdf`, 2 páginas, 4 chunks).
+
+**Decisión.** El umbral se **confirma en 0.45** — sin subir ni bajar. La
+verificación con `make smoke` arrojó **37/37 comprobaciones OK**, y en la
+sección 15 (la que decide la calibración) los dos casos críticos
+resolvieron como esperaba D13:
+
+- **Pregunta en dominio** ("¿Cuál es la franquicia aplicable a la
+  cobertura de daños por agua?") → `refused: false`, respuesta generada
+  en **1 sola iteración** del bucle agéntico, cita `poliza-ejemplo.pdf`
+  página 2 verificada literal contra la base con
+  `regexp_replace(content, '\s+', ' ', 'g')` (D12).
+- **Pregunta fuera de dominio** ("¿Cuál es la receta tradicional de la
+  tortilla de patatas?") → `refused: true` con `REJECTION_MESSAGE` (D13).
+
+El bucle no tuvo que refinar en el caso válido (el primer intento ya
+cruzó el umbral y la cita cuadró verbatim) — confirmación de que 0.45 no
+es ni tan estricto que rechace lo legítimo ni tan permisivo que deje
+pasar lo irrelevante, para este par consulta/documento con bge-m3.
+
+Nota operativa: durante la calibración se encontró un bug en el parser
+JSON del smoke (`jstr` casaba con strings citados pero no con bools ni
+`null`, así que `"refused": false` se leía como vacío y reportaba FAIL
+fantasma). Se añadió `jbool` (extrae `true`/`false` sin comillas) para
+los campos booleanos; `jstr` sigue usándose para strings. Bug del
+parser, no del umbral — pero importante dejarlo anotado para que el set
+de evaluación formal no herede falsos negativos.
+
+**Alternativas descartadas.** Subir a 0.55–0.60 ("más conservador"):
+con bge-m3, cosenos típicos para consultas legítimas sobre pólizas
+están en el rango 0.45–0.6; subir el umbral habría rechazado la
+consulta válida en la primera iteración y forzado refinamiento (con
+latencia y gasto de tokens) sin ganancia de precisión. Bajar a 0.30
+("más permisivo"): dejaría pasar la pregunta fuera de dominio, que
+justamente rompe la garantía del enunciado (no responder cuando la
+evidencia no alcanza). Calibración con set formal etiquetado (precision@
+k, recall@k) y curva ROC: queda para la Fase 5 (observabilidad) y la
+iteración de evaluación; por ahora el smoke end-to-end con los dos casos
+polo (uno válido, uno irrelevante) es la calibración mínima que el
+enunciado exige para cerrar la Fase 3.
+
+## D21 — Frontend Fase 4: React+Vite sobrio, citas navegables vía `/content`
+
+**Contexto.** El enunciado pide "subir y ver estado, preguntar, citas
+navegables" — tres bloques que cubren todo el flujo del analista de
+siniestros: cargar la póliza, seguir su ingesta asíncrona, consultar el
+agente RAG y verificar la cita abriendo el documento original en la
+página citada. La Fase 0 dejó un `App.jsx` placeholder servido por
+nginx con proxy `/api` al backend; la Fase 4 lo sustituye por la UI real.
+Una restricción: las citas del agente (D19) traen `{document, page,
+quote}` donde `document` es el **filename**, no el id del documento — y
+el endpoint para servir el PDF necesita el id. El frontend tiene que
+resolver ese mapeo.
+
+**Decisión.**
+
+- **Stack:** React 18 + Vite 5 ya estaban (Fase 0); se mantienen sin
+  añadir TypeScript, Tailwind, shadcn/ui ni React Router. JSX plano,
+  CSS plano con variables, `fetch` nativo. Es una MVP de tres vistas
+  (subida/listado, consulta, cita) — cualquier capa extra sería peso
+  sin retorno. Tema "asegurador sobrio": azul marino `#0F2A4A`,
+  system-ui, tablas densas, badges de estado (D04) con color por estado.
+- **Shell con tabs:** `App.jsx` mantiene la lista de documentos en su
+  estado y la comparte con las dos vistas. `DocumentsView` muestra la
+  subida + lista; `QueryView` muestra el form + resultado + citas.
+- **Polling 3s:** `setInterval` que llama a `GET /api/documents` cada 3
+  segundos mientras haya al menos un documento en `pending`/`processing`.
+  En cuanto todos están `ready`/`failed`, para. Sin WebSocket: la
+  ingesta de pólizas dura segundos y la complejidad de un canal WS no se
+  justifica para esta MVP.
+- **Subida:** zona drag&drop + `<input type=file>` clásico bajo el mismo
+  `label` (clic en la zona abre el selector). MIME aceptados: PDF y
+  texto plano. El backend valida (D08) tipo/tamaño/nombre — el frontend
+  confía en el 415/413/422 y muestra el `detail`.
+- **Cita navegable:** nueva ruta `GET /api/documents/{id}/content` sirve
+  el contenido crudo guardado en `document_contents` (D15) con el MIME
+  original, `Content-Disposition: inline` (¡no `attachment`!) y
+  `Cache-Control: public, max-age=3600` (el contenido es inmutable por
+  D03 — mismo hash = mismos bytes). El frontend abre
+  `/api/documents/{id}/content#page=N` en pestaña nueva: el visor de PDF
+  nativo del navegador salta a la página citada. El mapeo filename → id
+  lo hace `Citation.jsx` buscando en la lista de documentos del shell
+  por `filename`. Si no encuentra el documento (p. ej., fue borrado),
+  muestra la cita sin link — el `quote` sigue siendo información útil.
+
+**Alternativas descartadas.** Migrar a TypeScript + Tailwind + shadcn/ui
++ React Router (stack "moderno"): apilaría migración de build,
+configuración de TS, `tailwind.config`, dependencias nuevas y surface
+de testing sin valor visible para 3 vistas; la deuda que añadiría es
+mayor que la que quita. **WebSocket** en vez de polling: real-time pero
+con coste de servidor WS, reconexión, manejo de sesiones — la ingesta
+toma segundos y el analista mira la lista, no la mira en vivo.
+**Visor PDF embebido** (iframe con `/content` o `pdf.js` propio):
+integrado pero pesa con PDFs grandes y `pdf.js` añade ~1 MB de bundle.
+**`Content-Disposition: attachment`**: forzaría descarga; el navegador
+no abriría el visor y `#page=N` no tendría efecto — por eso `inline`.
+**Mapear filename → id en el backend** (que la cita trajera el id
+directamente): rompería el contrato del dominio (D12) donde la cita es
+"documento, página, fragmento" legible por un humano, no un UUID.
+
 ## Uso de IA generativa
 
 Metodología: análisis del enunciado y planificación con IA; generación asistida

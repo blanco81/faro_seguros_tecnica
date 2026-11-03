@@ -91,7 +91,7 @@ estado_final=""
 chunks_api=""
 
 echo "=================================================="
-echo " Smoke test del stack — Faro Seguros RAG (Fases 0-3)"
+echo " Smoke test del stack — Faro Seguros RAG (Fases 0-4)"
 echo "=================================================="
 
 echo ""
@@ -424,11 +424,61 @@ if [ "$estado_final" = "ready" ]; then
   fi
 fi
 
+# Sección 16 — Fase 4: frontend (shell con tabs + vista Documentos/Consulta)
+# y endpoint /content (cita navegable con #page=N, D12).
+if [ "$estado_final" = "ready" ]; then
+  echo ""
+  echo "16) Frontend Fase 4 + cita navegable (GET /api/documents/{id}/content)"
+
+  # 16a — el index del frontend contiene el título nuevo (shell React no placeholder)
+  curl -sS --max-time 5 "$FRONTEND_URL/" -o "$SMOKE_TMP/index.html" 2>/dev/null
+  if grep -q "Faro Seguros" "$SMOKE_TMP/index.html" 2>/dev/null && \
+     grep -qE '/assets/index-[A-Za-z0-9_-]+\.(js|css)' "$SMOKE_TMP/index.html" 2>/dev/null; then
+    ok "index.html sirve el shell React con assets bundleados"
+  else
+    bad "index.html no contiene el shell React o los assets (¿build del frontend OK?)"
+  fi
+
+  # 16b — el asset JS referenciado se descarga (vite build genera un solo chunk)
+  asset_js="$(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' "$SMOKE_TMP/index.html" 2>/dev/null | head -1)"
+  if [ -n "$asset_js" ]; then
+    codigo_asset="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$FRONTEND_URL$asset_js" 2>/dev/null)"
+    if [ "$codigo_asset" = "200" ]; then
+      ok "asset JS servido: $asset_js"
+    else
+      bad "asset JS $asset_js -> HTTP $codigo_asset"
+    fi
+  fi
+
+  # 16c — el endpoint /content del documento de ejemplo responde con el PDF inline.
+  # Cabeceras y cuerpo salen del MISMO GET (-D vuelca las cabeceras a fichero,
+  # igual que alta.headers en la sección 10). No usar curl -I: envía HEAD y
+  # FastAPI no acepta HEAD en rutas GET (APIRoute no lo añade, a diferencia
+  # de Starlette puro) — contesta 405 con JSON, y de ahí el falso
+  # "ct='application/json'" de la revisión anterior.
+  codigo_c="$(curl -sS -o "$SMOKE_TMP/content.bin" -D "$SMOKE_TMP/content.headers" \
+                -w '%{http_code}' --max-time 10 \
+                "$API_URL/api/documents/$doc_id/content" 2>/dev/null)"
+  if [ "$codigo_c" = "200" ]; then
+    ct="$(grep -i '^content-type:' "$SMOKE_TMP/content.headers" 2>/dev/null | tr -d '\r' | cut -d' ' -f2 | cut -d';' -f1)"
+    cd="$(grep -i '^content-disposition:' "$SMOKE_TMP/content.headers" 2>/dev/null | tr -d '\r' | cut -d' ' -f2-)"
+    tam="$(stat -c%s "$SMOKE_TMP/content.bin" 2>/dev/null || stat -f%z "$SMOKE_TMP/content.bin" 2>/dev/null)"
+    magic="$(head -c 4 "$SMOKE_TMP/content.bin" 2>/dev/null)"
+    if [ "$ct" = "application/pdf" ] && echo "$cd" | grep -qi '^inline' && [ "$magic" = "%PDF" ]; then
+      ok "GET /content -> 200, application/pdf, inline ($tam bytes, magic %PDF — cita navegable)"
+    else
+      bad "GET /content -> 200 pero cabeceras o cuerpo malos (ct='$ct', cd='$cd', magic='$magic')"
+    fi
+  else
+    bad "GET /api/documents/$doc_id/content -> HTTP $codigo_c"
+  fi
+fi
+
 echo ""
 echo "=================================================="
 echo " RESULTADO: $PASS OK / $FAIL FALLOS"
 if [ "$FAIL" -eq 0 ]; then
-  echo " SMOKE: TODO VERDE — Fase 3 verificada end-to-end"
+  echo " SMOKE: TODO VERDE — Fase 4 verificada end-to-end"
 else
   echo " SMOKE: hay fallos — revisar la lista de arriba"
 fi
