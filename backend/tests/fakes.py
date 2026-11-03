@@ -22,9 +22,10 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from app.domain.document import DocumentStatus
+from app.domain.retrieval import RetrievedChunk
 from app.ports.repository import DocumentInfo, NewChunk
 
-__all__ = ["FakeDocumentRepository"]
+__all__ = ["FakeDocumentRepository", "FakeRetriever", "ScriptedLLM", "StubEmbedder"]
 
 
 def _ahora() -> datetime:
@@ -150,3 +151,51 @@ class FakeDocumentRepository:
         """DocumentInfo con ``chunk_count`` vivo (como el COUNT del adapter)."""
         fila = self._filas[document_id]
         return replace(fila.info, chunk_count=len(fila.chunks))
+
+
+# --- Fase 3: dobles de consulta -------------------------------------------
+
+
+class ScriptedLLM:
+    """LLMProvider con respuestas encoladas: una por llamada, en orden.
+
+    Permite programar el desenlace de cada paso del bucle agéntico
+    (planificar / responder / refinar) sin red ni proveedor real. Si el
+    servicio hace una llamada de más, estalla en vez de colarse.
+    """
+
+    def __init__(self, *respuestas: str) -> None:
+        self.respuestas: list[str] = list(respuestas)
+        self.prompts: list[tuple[str | None, str]] = []
+
+    def chat(self, prompt: str, *, system: str | None = None) -> str:
+        self.prompts.append((system, prompt))
+        if not self.respuestas:
+            raise AssertionError("ScriptedLLM se quedó sin respuestas encoladas")
+        return self.respuestas.pop(0)
+
+
+class FakeRetriever:
+    """RetrievalPort con resultados fijos e inspección de llamadas."""
+
+    def __init__(self, resultados: Sequence[RetrievedChunk]) -> None:
+        self.resultados = list(resultados)
+        self.llamadas: list[dict] = []
+
+    def search(
+        self, query_embedding, *, top_k: int, document_id=None
+    ) -> list[RetrievedChunk]:
+        self.llamadas.append({"top_k": top_k, "document_id": document_id})
+        return self.resultados[:top_k]
+
+
+class StubEmbedder:
+    """EmbeddingProvider trivial: un vector distinto por posición, texto da igual."""
+
+    def __init__(self, dims: int = 4) -> None:
+        self.dims = dims
+        self.textos: list[str] = []
+
+    def embed(self, texts):
+        self.textos.extend(texts)
+        return [[0.1 * (i + 1)] * self.dims for i, _ in enumerate(texts)]

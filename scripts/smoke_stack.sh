@@ -76,10 +76,14 @@ SMOKE_TMP="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_TMP"' EXIT
 
 # Parseo de JSON con solo POSIX (grep/cut): el smoke no depende de jq.
-# jstr <clave> <fichero>  ->  valor de "clave":"valor" (strings)
-# jnum <clave> <fichero>  ->  valor de "clave":123 (números; null no matchea)
-jstr() { grep -o "\"$1\":\"[^\"]*\"" "$2" 2>/dev/null | head -1 | cut -d'"' -f4; }
-jnum() { grep -o "\"$1\":[0-9]*" "$2" 2>/dev/null | head -1 | cut -d':' -f2; }
+# jstr  <clave> <fichero>  ->  valor de "clave":"valor"  (strings; null -> "")
+# jbool <clave> <fichero>  ->  "true" | "false" | ""     (bools; null -> "")
+# jnum  <clave> <fichero>  ->  valor de "clave":123      (números; null no matchea)
+# Nota: jstr NO casa con bools ni nulls (sus valores no van entre comillas).
+# Usar jbool para campos booleanos (refused, etc.) y dejar jstr para strings.
+jstr()  { grep -o "\"$1\":\"[^\"]*\"" "$2" 2>/dev/null | head -1 | cut -d'"' -f4; }
+jbool() { grep -oE '"'"$1"'"'':(true|false)' "$2" 2>/dev/null | head -1 | cut -d: -f2; }
+jnum()  { grep -o "\"$1\":[0-9]*" "$2" 2>/dev/null | head -1 | cut -d':' -f2; }
 
 # Estado compartido entre las secciones 10-14 de la Fase 2.
 doc_id=""
@@ -87,7 +91,7 @@ estado_final=""
 chunks_api=""
 
 echo "=================================================="
-echo " Smoke test del stack — Faro Seguros RAG (Fases 0-2)"
+echo " Smoke test del stack — Faro Seguros RAG (Fases 0-3)"
 echo "=================================================="
 
 echo ""
@@ -349,11 +353,82 @@ cod="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
          "$API_URL/api/documents" 2>/dev/null || echo 000)"
 if [ "$cod" = "422" ]; then ok "sin nombre de archivo -> 422"; else bad "sin nombre de archivo -> '$cod' (esperaba 422)"; fi
 
+# --- Fase 3 (D19): consulta agéntica end-to-end -----------------------------
+# Caso A: la respuesta SÍ está en la póliza de ejemplo (cláusula 7.4, pág. 2).
+# Caso B: pregunta sin relación con los documentos -> rechazo explícito (D13).
+# --max-time 120: el bucle agéntico hace hasta 3 iteraciones con llamadas
+# reales al LLM (llama-3.3-70b); el caso habitual resuelve en ~15 s.
+if [ "$estado_final" = "ready" ]; then
+  echo ""
+  echo "15) Consulta RAG con cita verificada (POST /api/query, D12/D13/D19)"
+
+  codigo_q="$(curl -sS -o "$SMOKE_TMP/consulta.json" -w '%{http_code}' --max-time 120 \
+                -H 'Content-Type: application/json' \
+                -d '{"question": "¿Cuál es la franquicia aplicable a la cobertura de daños por agua?"}' \
+                "$API_URL/api/query" 2>/dev/null || echo 000)"
+
+  if [ "$codigo_q" != "200" ]; then
+    bad "consulta: HTTP $codigo_q — $(head -c 300 "$SMOKE_TMP/consulta.json" 2>/dev/null)"
+  else
+    ok "consulta aceptada: HTTP 200"
+    rehusada="$(jbool refused "$SMOKE_TMP/consulta.json")"
+    if [ "$rehusada" != "false" ]; then
+      razon="$(jstr reason "$SMOKE_TMP/consulta.json")"
+      bad "la consulta fue rehusada (razón: $razon) — si es below_threshold, el REJECTION_THRESHOLD del .env es demasiado alto para bge-m3: el punto de partida de D13 es 0.45"
+    else
+      respuesta_q="$(jstr answer "$SMOKE_TMP/consulta.json")"
+      iters_q="$(jnum iterations "$SMOKE_TMP/consulta.json")"
+      if [ -n "$respuesta_q" ]; then
+        ok "respuesta generada en $iters_q iteración(es) del agente"
+      else
+        bad "refused=false pero la respuesta llegó vacía"
+      fi
+
+      doc_cita="$(jstr document "$SMOKE_TMP/consulta.json")"
+      pag_cita="$(jnum page "$SMOKE_TMP/consulta.json")"
+      cita="$(jstr quote "$SMOKE_TMP/consulta.json")"
+      if [ -n "$doc_cita" ] && [ -n "$pag_cita" ] && [ -n "$cita" ]; then
+        ok "cita: $doc_cita, página $pag_cita"
+      else
+        bad "cita incompleta (doc='$doc_cita', pag='$pag_cita', quote='${cita:0:40}...')"
+      fi
+
+      # La cita debe ser LITERAL: aparece en un chunk de la base tras
+      # normalizar espacios (el ctrl+F del evaluador, D12). regexp_replace
+      # colapsa el whitespace en ambos lados, como hace el servicio.
+      if [ -n "$cita" ]; then
+        cita_sql="${cita//\'/\'\'}"
+        en_base="$(sql "SELECT count(*) FROM chunks WHERE strpos(regexp_replace(content, '\\s+', ' ', 'g'), regexp_replace('$cita_sql', '\\s+', ' ', 'g')) > 0")"
+        if [ "$en_base" -ge 1 ] 2>/dev/null; then
+          ok "la cita es literal: aparece en un chunk de la base (D12)"
+        else
+          bad "la cita NO aparece literalmente en la base (D12/D19)"
+        fi
+      fi
+    fi
+  fi
+
+  codigo_r="$(curl -sS -o "$SMOKE_TMP/rechazo.json" -w '%{http_code}' --max-time 120 \
+                -H 'Content-Type: application/json' \
+                -d '{"question": "¿Cuál es la receta tradicional de la tortilla de patatas?"}' \
+                "$API_URL/api/query" 2>/dev/null || echo 000)"
+  if [ "$codigo_r" = "200" ]; then
+    rehusada_r="$(jbool refused "$SMOKE_TMP/rechazo.json")"
+    if [ "$rehusada_r" = "true" ]; then
+      ok "pregunta fuera de dominio rehusada con mensaje (D13)"
+    else
+      bad "una pregunta sin relación con los documentos obtuvo respuesta — revisar umbral (D13)"
+    fi
+  else
+    bad "consulta fuera de dominio: HTTP $codigo_r — $(head -c 200 "$SMOKE_TMP/rechazo.json" 2>/dev/null)"
+  fi
+fi
+
 echo ""
 echo "=================================================="
 echo " RESULTADO: $PASS OK / $FAIL FALLOS"
 if [ "$FAIL" -eq 0 ]; then
-  echo " SMOKE: TODO VERDE — Fase 2 verificada end-to-end"
+  echo " SMOKE: TODO VERDE — Fase 3 verificada end-to-end"
 else
   echo " SMOKE: hay fallos — revisar la lista de arriba"
 fi

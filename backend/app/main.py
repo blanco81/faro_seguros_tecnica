@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.adapters.http.documents import documents_router
+from app.adapters.http.query import query_router
 from app.config import get_settings
 
 
@@ -31,6 +32,9 @@ def create_app() -> FastAPI:
 
     # Fase 2 paso 4: subida de documentos y seguimiento del estado.
     app.include_router(documents_router)
+
+    # Fase 3: consulta agéntica con cita verificada (D19).
+    app.include_router(query_router)
 
     return app
 

@@ -11,14 +11,21 @@ configurado (llm + embeddings): en la Fase 2 el worker solo embediza, pero
 dejar pasar un LLM mal configurado solo aplanta el error hasta la Fase 3.
 """
 
+from sqlalchemy.orm import Session
+
+from app.adapters.db.retrieval import PgVectorRetriever
 from app.adapters.extraction.extractors import build_default_extractor
+from app.adapters.llm.chat import OpenAICompatChatProvider
 from app.adapters.llm.embeddings import OpenAICompatEmbeddingProvider
 from app.adapters.llm.fake_embeddings import FakeEmbeddingProvider
+from app.adapters.llm.fake_llm import FakeLLMProvider
 from app.config import Settings, get_settings
 from app.ports.embeddings import EmbeddingProvider
 from app.ports.extraction import TextExtractor
+from app.ports.llm import LLMProvider
+from app.ports.retrieval import RetrievalPort
 
-__all__ = ["build_embedder", "build_extractor"]
+__all__ = ["build_embedder", "build_extractor", "build_llm", "build_retriever"]
 
 
 def build_extractor() -> TextExtractor:
@@ -62,3 +69,41 @@ def build_embedder(settings: Settings | None = None) -> EmbeddingProvider:
         batch_size=settings.embedding_batch_size,
         timeout=settings.embedding_timeout_seconds,
     )
+
+
+def build_llm(settings: Settings | None = None) -> LLMProvider:
+    """Construye el LLMProvider del proveedor configurado (Fase 3, D10).
+
+    Mismos presets que ``build_embedder`` (cloudflare / openai / fake) y
+    mismo fail-fast de credenciales (D14).
+    """
+    settings = settings or get_settings()
+    settings.validate_provider_credentials()
+
+    if settings.llm_provider == "fake":
+        return FakeLLMProvider()
+
+    if settings.llm_provider == "cloudflare":
+        cabeceras: dict[str, str] | None = None
+        if settings.cloudflare_gateway_id:
+            cabeceras = {"cf-aig-gateway-id": settings.cloudflare_gateway_id}
+        return OpenAICompatChatProvider(
+            model=settings.llm_model,
+            api_key=settings.cloudflare_api_token or "",
+            base_url=settings.cloudflare_ai_base_url,
+            extra_headers=cabeceras,
+            timeout=settings.llm_timeout_seconds,
+        )
+
+    # Preset OpenAI (o cualquier endpoint compatible auto-alojado).
+    return OpenAICompatChatProvider(
+        model=settings.llm_model,
+        api_key=settings.openai_api_key or "",
+        base_url=settings.openai_base_url,
+        timeout=settings.llm_timeout_seconds,
+    )
+
+
+def build_retriever(session: Session) -> RetrievalPort:
+    """RetrievalPort sobre la sesión inyectada (pgvector + HNSW, D02/D13)."""
+    return PgVectorRetriever(session)
