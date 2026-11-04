@@ -11,12 +11,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.adapters.http.documents import documents_router
 from app.adapters.http.query import query_router
 from app.config import get_settings
+from app.telemetry import instrument_api
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(title="Faro Seguros · RAG API", version="0.1.0")
+
+    # Fase 5 (D23): spans HTTP de este proceso + inyección de contexto en
+    # las tareas que publica + trazas de las llamadas al LLM (httpx). Con
+    # OTEL_ENABLED=false es un no-op total (tests/CI sin collector).
+    instrument_api(app)
 
     if settings.cors_origins:
         app.add_middleware(

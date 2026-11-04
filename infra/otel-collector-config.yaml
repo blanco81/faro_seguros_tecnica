@@ -1,6 +1,9 @@
-# Collector de OpenTelemetry: recibe OTLP de api y worker,
-# imprime las trazas en consola (exporter debug). Con --profile ui,
-# Jaeger consume OTLP en 4317/4318 y ofrece la UI en 16686.
+# Collector de OpenTelemetry: recibe OTLP de api y worker y lo reenvía a
+# dos destinos — el exporter debug imprime cada span en consola (lo que
+# inspecciona el smoke en su sección 17) y el exporter OTLP lo manda a
+# Jaeger (UI de trazas en http://localhost:16686). D25: Jaeger deja de ser
+# opt-in y arranca con el resto, así que este exporter siempre tiene destino.
+# Collector y Jaeger comparten la red intergraf_net → el DNS 'jaeger' resuelve.
 receivers:
   otlp:
     protocols:
@@ -15,10 +18,14 @@ processors:
 exporters:
   debug:
     verbosity: detailed
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [debug, otlp/jaeger]
