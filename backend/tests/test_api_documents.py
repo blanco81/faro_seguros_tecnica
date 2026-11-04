@@ -30,7 +30,9 @@ from app.adapters.http.documents import (
     get_repository_uow,
 )
 from app.config import Settings, get_settings
+from app.domain.document import DocumentStatus
 from app.main import app
+from app.ports.repository import NewChunk
 from tests.fakes import FakeDocumentRepository
 
 TEXTO_POLIZA = (
@@ -84,6 +86,22 @@ def cliente(repo, despachos):
 
 def _subir(client: TestClient, *, nombre="poliza.txt", data: bytes, mime="text/plain"):
     return client.post("/api/documents", files={"file": (nombre, data, mime)})
+
+
+def _ingerir(repo: FakeDocumentRepository, document_id: uuid.UUID) -> None:
+    """Lleva el documento a ``ready`` como haría el worker: chunks + estado."""
+    repo.replace_chunks(
+        document_id,
+        [
+            NewChunk(
+                page_number=1,
+                ordinal=0,
+                content="La póliza cubre daños por inundación en el hogar.",
+                embedding=[0.25, 0.75],
+            )
+        ],
+    )
+    repo.set_status(document_id, DocumentStatus.READY, page_count=2)
 
 
 # --- POST /api/documents ------------------------------------------------------
@@ -305,3 +323,102 @@ class TestContenido:
         assert detalle.headers["content-type"].startswith("application/json")
         assert not contenido.headers["content-type"].startswith("application/json")
         assert detalle.json()["id"] == document_id
+
+
+# --- DELETE /api/documents/{id} (D30) ----------------------------------------
+
+
+class TestBorrado:
+    """El contrato del borrado: cascada en el agregado, 404/409 honestos.
+
+    El doble modela la FK ``ON DELETE CASCADE`` (la fila lleva dentro sus
+    chunks y su contenido); la cascada CONTRA POSTGRESQL de verdad la
+    verifica el smoke — sección 17, que borra su propia sonda y comprueba
+    0 chunks en pgvector.
+    """
+
+    def test_borra_documento_ready_con_chunks_y_contenido(self, cliente, repo, despachos):
+        client = cliente()
+        data = TEXTO_POLIZA.encode("utf-8")
+        alta = _subir(client, data=data)
+        document_id = uuid.UUID(alta.json()["id"])
+        _ingerir(repo, document_id)  # chunks + ready, como el worker
+        assert repo.get(document_id).chunk_count == 1
+
+        respuesta = client.delete(f"/api/documents/{document_id}")
+
+        assert respuesta.status_code == 204
+        # El agregado entero desaparece: documento, contenido y chunks.
+        assert repo.get(document_id) is None
+        assert repo.get_content(document_id) is None
+        assert repo.list_documents() == []
+        # Borrar NO despacha ingesta: no hay tarea que correr.
+        assert despachos == [document_id]
+
+    def test_borrar_inexistente_da_404(self, cliente):
+        client = cliente()
+
+        respuesta = client.delete(f"/api/documents/{uuid.uuid4()}")
+
+        assert respuesta.status_code == 404
+
+    def test_borrar_pendiente_da_409_y_no_toca_nada(self, cliente, repo):
+        client = cliente()
+        alta = _subir(client, data=TEXTO_POLIZA.encode("utf-8"))
+        document_id = uuid.UUID(alta.json()["id"])
+
+        respuesta = client.delete(f"/api/documents/{document_id}")
+
+        assert respuesta.status_code == 409
+        assert "ingesta" in respuesta.json()["detail"]
+        # La subida sigue intacta: la tarea en vuelo podrá escribir.
+        assert repo.get(document_id) is not None
+        assert repo.get_content(document_id) is not None
+
+    def test_borrar_procesando_da_409(self, cliente, repo):
+        client = cliente()
+        alta = _subir(client, data=TEXTO_POLIZA.encode("utf-8"))
+        document_id = uuid.UUID(alta.json()["id"])
+        repo.set_status(document_id, DocumentStatus.PROCESSING)
+
+        respuesta = client.delete(f"/api/documents/{document_id}")
+
+        assert respuesta.status_code == 409
+        assert repo.get(document_id) is not None
+
+    def test_borrar_fallido_da_204(self, cliente, repo):
+        # Un failed es la subida rota que se quiere limpiar y re-subir:
+        # borrarla es el caso de uso natural del endpoint.
+        client = cliente()
+        alta = _subir(client, data=TEXTO_POLIZA.encode("utf-8"))
+        document_id = uuid.UUID(alta.json()["id"])
+        repo.set_status(
+            document_id,
+            DocumentStatus.FAILED,
+            failure_reason="PDF corrupto (extraction)",
+        )
+
+        respuesta = client.delete(f"/api/documents/{document_id}")
+
+        assert respuesta.status_code == 204
+        assert repo.get(document_id) is None
+
+    def test_resubir_tras_borrar_registra_de_nuevo(self, cliente, repo, despachos):
+        # El UNIQUE de content_hash (D03) vive en la fila: al borrarla,
+        # el hash queda libre y los mismos bytes registran documento
+        # NUEVO con tarea nueva — el "reprocesar" que antes exigía SQL.
+        client = cliente()
+        data = TEXTO_POLIZA.encode("utf-8")
+
+        primera = _subir(client, data=data)
+        id_primera = primera.json()["id"]
+        _ingerir(repo, uuid.UUID(id_primera))
+        assert client.delete(f"/api/documents/{id_primera}").status_code == 204
+
+        segunda = _subir(client, data=data)
+
+        assert segunda.status_code == 201  # de nuevo un alta, no 200 (D03)
+        assert segunda.json()["id"] != id_primera
+        assert segunda.json()["status"] == "pending"
+        # Dos tareas: la de la primera subida y la del re-registro.
+        assert len(despachos) == 2

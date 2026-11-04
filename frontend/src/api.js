@@ -36,6 +36,22 @@ export async function subirDocumento(file) {
   return _json(r);
 }
 
+export async function eliminarDocumento(documentId) {
+  // DELETE /api/documents/{id} -> 204 SIN cuerpo (D30): no puede pasar por
+  // _json porque no hay JSON que parsear. Los errores sí traen {detail}.
+  const r = await fetch(`${BASE}/documents/${documentId}`, { method: "DELETE" });
+  if (!r.ok) {
+    let detalle;
+    try {
+      detalle = (await r.json()).detail ?? `HTTP ${r.status}`;
+    } catch {
+      detalle = `HTTP ${r.status} — ${r.statusText}`;
+    }
+    throw new Error(detalle);
+  }
+  return true;
+}
+
 export async function consultar(question, documentId = null) {
   // POST /api/query: {question, document_id?} -> QueryOut (D19).
   const body = { question };

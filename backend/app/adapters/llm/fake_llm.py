@@ -22,9 +22,11 @@ import re
 
 __all__ = ["FakeLLMProvider"]
 
-#: Un fragmento del contexto: "FRAGMENTO 3 (documento X, página 2):\n<texto>"
+#: Un fragmento del contexto, aislado como dato (D08):
+#: '<fragmento numero="3" documento="X" pagina="2">\n<texto>\n</fragmento>'
 _FRAGMENTO = re.compile(
-    r"FRAGMENTO \d+ \(documento [^)]+\):\n(.+?)(?=\n\nFRAGMENTO|\Z)", re.DOTALL
+    r'<fragmento numero="\d+" documento="[^"]*" pagina="\d+">\n(.+?)\n</fragmento>',
+    re.DOTALL,
 )
 #: La línea de pregunta del prompt: "PREGUNTA: ¿...?"
 _PREGUNTA = re.compile(r"PREGUNTA:\s*(.+)")

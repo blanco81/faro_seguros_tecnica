@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { subirDocumento } from "../api.js";
+import { eliminarDocumento, subirDocumento } from "../api.js";
 
 // Vista de Documentos (Fase 4).
 //
@@ -10,7 +10,8 @@ import { subirDocumento } from "../api.js";
 //
 // El estado de subida local (enviando / error) NO se comparte con la
 // consulta: la subida dispara onSubida() que hace refrescar al shell,
-// y el shell propaga la lista nueva por props.
+// y el shell propaga la lista nueva por props. El borrado (D30) reusa
+// el mismo callback: es el "lista, refresca" del shell.
 
 const MIME_PERMITIDOS = ["application/pdf", "text/plain"];
 
@@ -43,11 +44,17 @@ const ETIQUETA_ESTADO = {
   failed: "Falló",
 };
 
+// Estados con la tarea de ingesta en vuelo: el backend rechaza el borrado
+// con 409 (D30) — el botón lo anticipa deshabilitándose (espejo del API).
+const EN_INGESTA = new Set(["pending", "processing"]);
+
 export default function DocumentsView({ documentos, onSubida }) {
   const [arrastrando, setArrastrando] = useState(false);
   const [subiendo, setSubiendo] = useState(false);
   const [errorSubida, setErrorSubida] = useState(null);
   const [ultimoSubido, setUltimoSubido] = useState(null);
+  const [borrando, setBorrando] = useState(null); // id en vuelo (D30)
+  const [errorBorrado, setErrorBorrado] = useState(null);
   const inputRef = useRef(null);
 
   async function manejarArchivo(file) {
@@ -62,6 +69,28 @@ export default function DocumentsView({ documentos, onSubida }) {
       setErrorSubida(e.message);
     } finally {
       setSubiendo(false);
+    }
+  }
+
+  async function manejarBorrado(doc) {
+    // Confirmación explícita: el borrado arrastra chunks, embeddings y el
+    // archivo original (FK CASCADE, D30) — y liberar el hash permite
+    // re-subirlo después, pero lo borrado no vuelve.
+    const seguro = window.confirm(
+      `¿Eliminar "${doc.filename}"?\n` +
+        `Se borran también sus ${doc.chunk_count} chunk(s) con embeddings ` +
+        `y el archivo original. No se puede deshacer.`
+    );
+    if (!seguro) return;
+    setBorrando(doc.id);
+    setErrorBorrado(null);
+    try {
+      await eliminarDocumento(doc.id);
+      await onSubida(); // refresca la lista (mismo canal que la subida)
+    } catch (e) {
+      setErrorBorrado(e.message);
+    } finally {
+      setBorrando(null);
     }
   }
 
@@ -133,6 +162,9 @@ export default function DocumentsView({ documentos, onSubida }) {
 
       <section className="panel">
         <h2>Documentos cargados</h2>
+        {errorBorrado && (
+          <div className="error-msg">No se pudo eliminar: {errorBorrado}</div>
+        )}
         {documentos.length === 0 ? (
           <div className="vacio">
             Todavía no hay documentos. Sube uno arriba para empezar.
@@ -147,34 +179,52 @@ export default function DocumentsView({ documentos, onSubida }) {
                 <th>Chunks</th>
                 <th>Tamaño</th>
                 <th>Subido</th>
+                <th>Acciones</th>
               </tr>
             </thead>
             <tbody>
-              {documentos.map((d) => (
-                <tr key={d.id}>
-                  <td className="filename">{d.filename}</td>
-                  <td>
-                    <span className={`badge ${d.status}`}>
-                      {ETIQUETA_ESTADO[d.status]}
-                    </span>
-                    {d.status === "failed" && d.failure_reason && (
-                      <div
-                        style={{
-                          fontSize: "0.7rem",
-                          color: "var(--st-failed)",
-                          marginTop: "0.2rem",
-                        }}
+              {documentos.map((d) => {
+                const en_ingesta = EN_INGESTA.has(d.status);
+                return (
+                  <tr key={d.id}>
+                    <td className="filename">{d.filename}</td>
+                    <td>
+                      <span className={`badge ${d.status}`}>
+                        {ETIQUETA_ESTADO[d.status]}
+                      </span>
+                      {d.status === "failed" && d.failure_reason && (
+                        <div
+                          style={{
+                            fontSize: "0.7rem",
+                            color: "var(--st-failed)",
+                            marginTop: "0.2rem",
+                          }}
+                        >
+                          {d.failure_reason}
+                        </div>
+                      )}
+                    </td>
+                    <td>{d.page_count ?? "—"}</td>
+                    <td>{d.chunk_count}</td>
+                    <td>{formatearTamano(d.size_bytes)}</td>
+                    <td>{formatearFecha(d.created_at)}</td>
+                    <td>
+                      <button
+                        className="btn-borrar"
+                        onClick={() => manejarBorrado(d)}
+                        disabled={borrando === d.id || en_ingesta}
+                        title={
+                          en_ingesta
+                            ? "Espera a que termine la ingesta para borrarlo (HTTP 409)"
+                            : "Elimina el documento con sus chunks y embeddings (D30)"
+                        }
                       >
-                        {d.failure_reason}
-                      </div>
-                    )}
-                  </td>
-                  <td>{d.page_count ?? "—"}</td>
-                  <td>{d.chunk_count}</td>
-                  <td>{formatearTamano(d.size_bytes)}</td>
-                  <td>{formatearFecha(d.created_at)}</td>
-                </tr>
-              ))}
+                        {borrando === d.id ? "Borrando…" : "Eliminar"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

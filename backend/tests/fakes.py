@@ -14,6 +14,11 @@ contrato que en la base real garantizan el esquema y el ORM:
 - ``save_content`` es 1:1 (D15): segundo contenido para el mismo
   documento lanza ``ValueError``, como la PK duplicada de la tabla
   ``document_contents``.
+- ``delete`` modela la FK ``ON DELETE CASCADE`` (D30): la fila entera
+  — documento, chunks y contenido — vive junta, así que sacarla del
+  dict es el borrado en cascada del adapter. Y como en la base real,
+  el ``content_hash`` UNIQUE (D03) queda libre: los mismos bytes pueden
+  registrarse de nuevo tras borrar.
 """
 
 import uuid
@@ -108,6 +113,12 @@ class FakeDocumentRepository:
         # DELETE + INSERT: sustituye la lista, nunca concatena (D03).
         fila.chunks = list(chunks)
         return len(fila.chunks)
+
+    def delete(self, document_id: uuid.UUID) -> bool:
+        # ON DELETE CASCADE (D30): chunks y contenido viven DENTRO de la
+        # fila — sacarla del dict tumba el agregado entero, como la FK
+        # de la base real tumba chunks y document_contents.
+        return self._filas.pop(document_id, None) is not None
 
     def save_content(self, document_id: uuid.UUID, data: bytes) -> None:
         fila = self._filas.get(document_id)

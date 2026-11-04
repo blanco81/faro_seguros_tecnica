@@ -212,6 +212,31 @@ a:hover { text-decoration: underline; }
   background: var(--azul-claro);
 }
 
+/* Botón de borrado por fila (D30): discreto por defecto, rojo al pasar
+   el ratón — la acción es destructiva y el color lo anuncia solo cuando
+   el puntero YA está encima, no mientras se lee la tabla. */
+.btn-borrar {
+  padding: 0.25rem 0.7rem;
+  border-radius: var(--radio);
+  border: 1px solid var(--gris-borde);
+  background: var(--blanco);
+  color: var(--texto-sec);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 500;
+  transition: color 0.1s, border-color 0.1s, background 0.1s;
+}
+.btn-borrar:hover:not(:disabled) {
+  color: var(--st-failed);
+  border-color: var(--st-failed);
+  background: var(--blanco);
+}
+.btn-borrar:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* --- formulario de consulta --- */
 .consulta-input {
   width: 100%;
