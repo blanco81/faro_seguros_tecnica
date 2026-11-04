@@ -15,12 +15,16 @@ de producción (create_app + setup_telemetry reales, OTEL_ENABLED=true):
      contexto: las cabeceras del mensaje llevan traceparent (paso 3)
   F. la ejecución de una tarea (ping en modo eager) genera su span
      "tasks.ping/run" (la mitad consumidora del paso 3)
+  G. POST /api/query en la app REAL emite los spans de dominio RAG
+     (rag.consulta + rag.iteracion, D27) con el tracer POR DEFECTO —
+     el mismo wiring de producción, sin inyectar nada
 
 Uso:  python3 scripts/verifica_telemetria_local.py   (desde la raíz del repo)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -88,6 +92,53 @@ def main() -> int:
     )
 
     provider_global = trace.get_tracer_provider()
+
+    # --- G: el bucle RAG de la ruta REAL, con el tracer por defecto (D27) --
+    # La ruta /api/query con dobles de retriever/embedder (sin base) — el
+    # servicio NO recibe tracer: usa trace.get_tracer(), que delega en el
+    # provider global que create_app acaba de montar. Es exactamente el
+    # wiring de producción; los spans deben salir por el mismo OTLP.
+    from app.adapters.http.query import get_query_service
+    from app.domain.retrieval import RetrievedChunk
+    from app.services.query import AgenticQueryService
+    from tests.fakes import FakeRetriever, ScriptedLLM, StubEmbedder
+
+    pregunta_rag = "¿Cuál es la franquicia aplicable a los daños por agua?"
+    chunk_rag = RetrievedChunk(
+        document="poliza-hogar.pdf",
+        page=2,
+        content=(
+            "Cláusula 7.4 — Franquicia. Para la cobertura de daños por agua "
+            "se aplica una franquicia de 300 euros por siniestro."
+        ),
+        score=0.87,
+    )
+    llm_rag = ScriptedLLM(
+        json.dumps({"subquestions": [pregunta_rag]}),
+        json.dumps(
+            {
+                "answer": "La franquicia es de 300 euros por siniestro.",
+                "quote": "se aplica una franquicia de 300 euros por siniestro",
+            }
+        ),
+    )
+    app.dependency_overrides[get_query_service] = lambda: AgenticQueryService(
+        llm=llm_rag,
+        embedder=StubEmbedder(),
+        retriever=FakeRetriever([chunk_rag]),
+        rejection_threshold=0.45,
+    )
+    try:
+        with TestClient(app) as client:
+            respuesta_rag = client.post("/api/query", json={"question": pregunta_rag})
+        check(
+            "POST /api/query (con dobles) responde 200",
+            respuesta_rag.status_code == 200
+            and respuesta_rag.json().get("refused") is False,
+            f"status={respuesta_rag.status_code}",
+        )
+    except Exception as exc:  # noqa: BLE001 — se reporta abajo
+        check("POST /api/query (con dobles) responde 200", False, str(exc))
 
     # --- D: llamada httpx de cliente (el camino del SDK de OpenAI) --------
     import httpx
@@ -174,6 +225,11 @@ def main() -> int:
         "F. span de ejecución de la tarea (tasks.ping/run)",
         b"tasks.ping" in cuerpos,
         "",
+    )
+    check(
+        "G. spans de dominio RAG (rag.consulta + rag.iteracion, D27)",
+        b"rag.consulta" in cuerpos and b"rag.iteracion" in cuerpos,
+        "deben salir por el mismo OTLP que el resto (tracer por defecto)",
     )
 
     print()

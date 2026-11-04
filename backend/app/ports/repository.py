@@ -15,6 +15,12 @@ Decisiones que fija el contrato:
   los chunks previos del documento e inserta los nuevos dentro de la
   transacción de la sesión inyectada. Reejecutar la ingesta deja
   siempre el mismo estado final — nunca chunks duplicados ni huérfanos.
+- **``delete`` borra el agregado ENTERO en cascada** (D30): un solo
+  ``DELETE`` del documento tumba también sus chunks y su contenido —
+  en la base real lo garantiza la FK ``ON DELETE CASCADE`` del esquema
+  (migraciones 0001/0002), así que el adapter no necesita N consultas
+  ni estado parcial. El ``content_hash`` UNIQUE (D03) queda libre:
+  re-subir los mismos bytes tras borrar registra un documento nuevo.
 - **Las transiciones de estado NO se validan aquí**: las valida el
   dominio (``ensure_transition``, D04) antes de llamar a ``set_status``.
   El puerto persiste lo que le mandan; el dominio decide qué es legal.
@@ -135,6 +141,21 @@ class DocumentRepository(Protocol):
 
         Raises:
             ValueError: si el documento no existe.
+        """
+        ...
+
+    def delete(self, document_id: uuid.UUID) -> bool:
+        """Elimina el documento y, en cascada, sus chunks y su contenido.
+
+        Un solo borrado del agregado (D30): quien llama decide si el
+        estado actual permite borrar — el puerto persiste lo que le
+        mandan, la política de la ruta es del adapter HTTP (409 en
+        ``pending``/``processing``). El UNIQUE de ``content_hash``
+        (D03) queda libre tras el borrado: los mismos bytes pueden
+        registrarse de nuevo como documento nuevo.
+
+        Returns:
+            ``True`` si existía y se eliminó; ``False`` si no existía.
         """
         ...
 

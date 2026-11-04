@@ -11,6 +11,9 @@ Regla de la suite (D01): sin red ni collector. Por eso:
   el smoke contra el stack levantado (sección 17).
 """
 
+import json
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.trace import TracerProvider
@@ -19,7 +22,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 
+from app.adapters.http.query import get_query_service, query_router
 from app.config import Settings
+from app.domain.retrieval import RetrievedChunk
+from app.services.query import (
+    SPAN_CONSULTA,
+    SPAN_ITERACION,
+    AgenticQueryService,
+)
 from app.telemetry import (
     SERVICE_API,
     instrument_api,
@@ -27,6 +37,7 @@ from app.telemetry import (
     setup_telemetry,
 )
 from app.telemetry.setup import _build_provider
+from tests.fakes import FakeRetriever, ScriptedLLM, StubEmbedder
 
 
 def _settings_desactivados() -> Settings:
@@ -185,3 +196,196 @@ def test_jaeger_arranca_con_el_resto() -> None:
 
     compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text()
     assert "profiles:" not in compose, "Jaeger sigue siendo opt-in (quitar profiles)"
+
+
+# --- Fase 5 (D27): spans de dominio RAG ---------------------------------------
+#
+# El servicio emite rag.consulta (raíz: desenlace, umbral, iteraciones) y
+# rag.iteracion (hijo por vuelta: scores vs umbral, decisión). Se prueban
+# con el MISMO patrón del resto del archivo: provider aislado en memoria
+# que jamás toca el global del proceso.
+
+PREGUNTA_RAG = "¿Cuál es la franquicia aplicable a los daños por agua?"
+
+CHUNK_RAG = RetrievedChunk(
+    document="poliza-hogar.pdf",
+    page=2,
+    content=(
+        "Cláusula 7.4 — Franquicia. Para la cobertura de daños por agua "
+        "se aplica una franquicia de 300 euros por siniestro."
+    ),
+    score=0.87,
+)
+CITA_RAG = "se aplica una franquicia de 300 euros por siniestro"
+
+
+def _json_rag(**datos):
+    return json.dumps(datos)
+
+
+def _servicio_rag(llm, chunks, *, umbral=0.45, tracer=None):
+    """El servicio real con dobles de test y tracer inyectado."""
+    return AgenticQueryService(
+        llm=llm,
+        embedder=StubEmbedder(),
+        retriever=FakeRetriever(chunks),
+        rejection_threshold=umbral,
+        tracer=tracer,
+    )
+
+
+def _spans(exporter, nombre):
+    return [s for s in exporter.get_finished_spans() if s.name == nombre]
+
+
+def test_respuesta_deja_consulta_e_iteracion_con_score_sobre_umbral() -> None:
+    """D27: la traza cuenta la historia — raíz rag.consulta con desenlace
+    respondida y un hijo rag.iteracion con el score que cruzó el umbral."""
+    provider, exporter = _provider_memoria()
+    llm = ScriptedLLM(
+        _json_rag(subquestions=[PREGUNTA_RAG]),
+        _json_rag(answer="La franquicia es de 300 euros.", quote=CITA_RAG),
+    )
+    servicio = _servicio_rag(llm, [CHUNK_RAG], tracer=provider.get_tracer("t"))
+
+    resultado = servicio.answer(PREGUNTA_RAG)
+
+    assert resultado.refused is False
+    (raiz,) = _spans(exporter, SPAN_CONSULTA)
+    assert raiz.attributes["rag.pregunta"] == PREGUNTA_RAG
+    assert raiz.attributes["rag.umbral"] == 0.45
+    assert raiz.attributes["rag.desenlace"] == "respondida"
+    assert raiz.attributes["rag.iteraciones"] == 1
+    assert raiz.attributes["rag.citas"] == 1
+    assert "rag.motivo" not in raiz.attributes  # responder no es fallar
+
+    (iteracion,) = _spans(exporter, SPAN_ITERACION)
+    assert iteracion.attributes["rag.decision"] == "ok"
+    assert iteracion.attributes["rag.cita_verificada"] is True
+    assert iteracion.attributes["rag.mejor_score"] == pytest.approx(0.87)
+    assert iteracion.attributes["rag.superumbral"] is True
+    assert "0.8700" in iteracion.attributes["rag.scores"]
+    assert iteracion.attributes["rag.queries"] == 1
+    assert iteracion.attributes["rag.resultados"] == 1
+    # waterfall de Jaeger: la iteración cuelga de la consulta
+    assert iteracion.parent.span_id == raiz.context.span_id
+
+
+def test_rechazo_registra_scores_bajo_umbral_por_iteracion() -> None:
+    """El pin del paso: scores vs umbral por iteración. Tres vueltas con
+    mejor_score 0.30 < umbral 0.45 y la raíz con el rechazo completo."""
+    chunk_flojo = RetrievedChunk(
+        document=CHUNK_RAG.document,
+        page=CHUNK_RAG.page,
+        content=CHUNK_RAG.content,
+        score=0.30,  # < umbral 0.45 (D13): evidencia insuficiente
+    )
+    provider, exporter = _provider_memoria()
+    llm = ScriptedLLM(
+        _json_rag(subquestions=[PREGUNTA_RAG]),
+        _json_rag(query="reformulación 1"),
+        _json_rag(query="reformulación 2"),
+    )
+    servicio = _servicio_rag(llm, [chunk_flojo], tracer=provider.get_tracer("t"))
+
+    resultado = servicio.answer(PREGUNTA_RAG)
+
+    assert resultado.refused is True
+    assert resultado.reason == "below_threshold"
+    (raiz,) = _spans(exporter, SPAN_CONSULTA)
+    assert raiz.attributes["rag.desenlace"] == "rechazada"
+    assert raiz.attributes["rag.motivo"] == "below_threshold"
+    assert raiz.attributes["rag.iteraciones"] == 3
+    assert raiz.attributes["rag.citas"] == 0
+
+    iteraciones = sorted(
+        _spans(exporter, SPAN_ITERACION),
+        key=lambda s: s.attributes["rag.iteracion"],
+    )
+    assert len(iteraciones) == 3
+    for numero, span in enumerate(iteraciones, start=1):
+        assert span.attributes["rag.iteracion"] == numero
+        assert span.attributes["rag.decision"] == "below_threshold"
+        assert span.attributes["rag.mejor_score"] == pytest.approx(0.30)
+        assert span.attributes["rag.superumbral"] is False
+        # el pin literal: el score registrado queda BAJO el umbral registrado
+        assert span.attributes["rag.mejor_score"] < span.attributes["rag.umbral"]
+        assert "0.3000" in span.attributes["rag.scores"]
+        # nunca llegó a generar: sin atributo de cita
+        assert "rag.cita_verificada" not in span.attributes
+
+
+def test_el_refinamiento_deja_huella_por_iteracion() -> None:
+    """citation_mismatch → refinar → ok: cada vuelta anota SU decisión."""
+    provider, exporter = _provider_memoria()
+    llm = ScriptedLLM(
+        _json_rag(subquestions=[PREGUNTA_RAG]),
+        _json_rag(answer="Unos trescientos.", quote="cita inventada"),
+        _json_rag(query="reformulada"),
+        _json_rag(answer="La franquicia es de 300 euros.", quote=CITA_RAG),
+    )
+    servicio = _servicio_rag(llm, [CHUNK_RAG], tracer=provider.get_tracer("t"))
+
+    resultado = servicio.answer(PREGUNTA_RAG)
+
+    assert resultado.refused is False
+    assert resultado.iterations == 2
+    (raiz,) = _spans(exporter, SPAN_CONSULTA)
+    assert raiz.attributes["rag.desenlace"] == "respondida"
+    assert raiz.attributes["rag.iteraciones"] == 2
+
+    iteraciones = sorted(
+        _spans(exporter, SPAN_ITERACION),
+        key=lambda s: s.attributes["rag.iteracion"],
+    )
+    decisiones = [s.attributes["rag.decision"] for s in iteraciones]
+    assert decisiones == ["citation_mismatch", "ok"]
+    assert iteraciones[0].attributes["rag.cita_verificada"] is False
+    assert iteraciones[1].attributes["rag.cita_verificada"] is True
+
+
+def test_aclaracion_cierra_la_consulta_sin_iteraciones() -> None:
+    """El planificador pide aclaración antes de recuperar: la traza es la
+    raíz con desenlace aclaracion y CERO spans de iteración."""
+    provider, exporter = _provider_memoria()
+    llm = ScriptedLLM(
+        _json_rag(clarification="¿La póliza de hogar o la de auto?")
+    )
+    servicio = _servicio_rag(llm, [CHUNK_RAG], tracer=provider.get_tracer("t"))
+
+    resultado = servicio.answer("¿Qué cubre la póliza?")
+
+    assert resultado.clarification == "¿La póliza de hogar o la de auto?"
+    (raiz,) = _spans(exporter, SPAN_CONSULTA)
+    assert raiz.attributes["rag.desenlace"] == "aclaracion"
+    assert raiz.attributes["rag.iteraciones"] == 0
+    assert raiz.attributes["rag.citas"] == 0
+    assert _spans(exporter, SPAN_ITERACION) == []
+
+
+def test_el_span_de_dominio_cuelga_del_span_http() -> None:
+    """Wiring de producción: POST /api/query genera el span HTTP del
+    servidor y, debajo, rag.consulta → rag.iteracion — la cascada que se
+    ve en Jaeger para el servicio faro-api."""
+    provider, exporter = _provider_memoria()
+    app = FastAPI()
+    app.include_router(query_router)
+    instrument_api(app, tracer_provider=provider)
+    llm = ScriptedLLM(
+        _json_rag(subquestions=[PREGUNTA_RAG]),
+        _json_rag(answer="La franquicia es de 300 euros.", quote=CITA_RAG),
+    )
+    app.dependency_overrides[get_query_service] = lambda: _servicio_rag(
+        llm, [CHUNK_RAG], tracer=provider.get_tracer("t")
+    )
+
+    with TestClient(app) as client:
+        respuesta = client.post("/api/query", json={"question": PREGUNTA_RAG})
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["refused"] is False
+    spans = exporter.get_finished_spans()
+    http = next(s for s in spans if s.name == "POST /api/query")
+    (raiz,) = _spans(exporter, SPAN_CONSULTA)
+    assert raiz.parent.span_id == http.context.span_id
+    assert any(s.name == SPAN_ITERACION for s in spans)

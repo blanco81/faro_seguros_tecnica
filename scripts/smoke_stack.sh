@@ -1,15 +1,15 @@
 #!/bin/bash
 # ============================================================
-# Faro Seguros RAG — smoke test del stack completo (Fases 0-2)
+# Faro Seguros RAG — smoke test del stack completo (Fases 0-6)
 #
-# Verifica el sistema REAL corriendo. Los 141 tests unitarios ya
-# los valida el CI en cada push; esto prueba lo que el CI no
-# puede: el stack arrancado de verdad (migración contra
-# PostgreSQL, pgvector + HNSW, Celery via Redis, la cadena
-# .env -> compose -> contenedor, el dominio de la Fase 1 vivo
-# dentro de la imagen y — Fase 2, secciones 10-14 — la ingesta
-# asíncrona COMPLETA: subida por la API, tarea Celery, embeddings
-# del proveedor configurado (real o fake, D14) y chunks en la base.
+# Verifica el sistema REAL corriendo: 18 secciones / 58 comprobaciones
+# esperadas. Los tests unitarios (216) los valida el CI en cada push;
+# esto prueba lo que el CI no puede: el stack arrancado de verdad
+# (migración contra PostgreSQL, pgvector + HNSW, Celery via Redis, la
+# cadena .env -> compose -> contenedor, la ingesta asíncrona COMPLETA,
+# la consulta agéntica con cita verificada, el frontend, las trazas
+# OTLP de punta a punta y — sección 18 — la evaluación de recuperación
+# con el set etiquetado (precision@k / recall@k, D28).
 #
 # Re-ejecutable por diseño (D18): la idempotencia de subida (D03)
 # hace que re-correr el smoke sea un no-evento (200, mismo id).
@@ -71,6 +71,9 @@ sql() { compose exec -T db psql -U faro -d faro -tAc "$1" </dev/null 2>/dev/null
 # PDF de ejemplo commiteado (2 páginas, cubierto por los tests de extracción).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POLIZA_EJEMPLO="$SCRIPT_DIR/data/poliza-ejemplo.pdf"
+# Las otras dos pólizas del set de evaluación (D29): las sube la sección 18.
+POLIZA_AUTO="$SCRIPT_DIR/data/poliza-auto.pdf"
+POLIZA_VIDA="$SCRIPT_DIR/data/poliza-vida.pdf"
 # Espacio temporal para cuerpos y cabeceras de las llamadas HTTP del smoke.
 SMOKE_TMP="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_TMP"' EXIT
@@ -592,11 +595,126 @@ else
   bad "Jaeger sin traza que cruce servicios — reenvía pero sin propagación visible (D25)"
 fi
 
+# Spans de dominio RAG (D27): la consulta de la sección 15 dejó en Jaeger
+# rag.consulta (desenlace de la consulta) con rag.iteracion dentro (scores
+# vs umbral por vuelta del bucle). Jaeger indexa por operación: la API REST
+# filtra service+operation. Solo si la sección 15 llegó a correr (ready).
+if [ "$estado_final" = "ready" ]; then
+  traza_rag="$(curl -fsS --max-time 5 \
+    "$jaeger_api/api/traces?service=faro-api&operation=rag.consulta&limit=5" 2>/dev/null || true)"
+  if echo "$traza_rag" | grep -q "rag.desenlace"; then
+    ok "span de dominio rag.consulta en Jaeger con desenlace (respondida/rechazada/aclaración, D27)"
+  else
+    bad "sin rag.consulta en Jaeger — los spans de dominio del bucle (D27) no llegaron"
+  fi
+  if echo "$traza_rag" | grep -q "rag.mejor_score" && echo "$traza_rag" | grep -q "rag.umbral"; then
+    ok "scores vs umbral por iteración en Jaeger (rag.iteracion: mejor_score/umbral, D27)"
+  else
+    bad "sin rag.mejor_score/rag.umbral en Jaeger — atributos de las iteraciones (D27)"
+  fi
+fi
+
+# Limpieza de la sonda (D30): ya verificó las trazas — ahora el smoke se
+# recoge a sí mismo. El DELETE ejercita el endpoint nuevo end-to-end (la
+# FK ON DELETE CASCADE tumba chunks y contenido en la base real) y la
+# lista de documentos queda sin residuos: re-correr el smoke ya no
+# acumula sondas de corridas anteriores (las viejas, si las hay, se
+# borran a mano desde el frontend — el mismo endpoint).
+# Solo con sonda en estado terminal (ready/failed): en plena ingesta el
+# DELETE responde 409 por contrato (D30) y el intento fallaría por diseño.
+if [ -n "$sonda_id" ] && { [ "$estado_sonda" = "ready" ] || [ "$estado_sonda" = "failed" ]; }; then
+  codigo_borrado="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X DELETE "$API_URL/api/documents/$sonda_id" 2>/dev/null || echo 000)"
+  detalle_tras_borrado="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    "$API_URL/api/documents/$sonda_id" 2>/dev/null || echo 000)"
+  if [ "$codigo_borrado" = "204" ] && [ "$detalle_tras_borrado" = "404" ]; then
+    ok "sonda eliminada (DELETE 204 y GET posterior 404): el smoke no deja residuo (D30)"
+  else
+    bad "la sonda no se eliminó (DELETE $codigo_borrado, GET después $detalle_tras_borrado) — endpoint D30"
+  fi
+  chunks_sonda="$(sql "SELECT count(*) FROM chunks WHERE document_id = '$sonda_id'")"
+  if [ "$codigo_borrado" = "204" ] && [ "$chunks_sonda" = "0" ]; then
+    ok "cascada real: 0 chunks del documento en pgvector tras el DELETE (FK ON DELETE CASCADE, D30)"
+  elif [ "$codigo_borrado" = "204" ]; then
+    bad "quedan $chunks_sonda chunks del documento borrado — la FK CASCADE no disparó"
+  fi
+fi
+
+# Sección 18 — Fase 5 (D28) / Fase 6 (D29): evaluación de recuperación con
+# el set etiquetado (precision@k / recall@k y barrido de umbral — la
+# calibración formal que D20 dejó pendiente). Corre DENTRO del contenedor
+# api con el mismo proveedor de embeddings y el mismo pgvector que
+# producción. La sección 10 ya subió la póliza hogar; aquí se suben las
+# otras dos del set (auto y vida, D29) y se espera a que la ingesta las
+# deje ready — el runner localiza las TRES por sha256 (no por nombre,
+# D03) y las necesita todas en 'ready' para medir.
+# El reporte completo — tabla por caso, medias y barrido de umbral — se
+# muestra entero; los tres checks grepean las líneas EVAL (el formato
+# estable que emite el runner para máquinas).
+if [ "$estado_final" = "ready" ]; then
+  echo ""
+  echo "18) Evaluación de recuperación: set etiquetado P@k/R@k, 3 pólizas (D28/D29)"
+
+  for extra in "$POLIZA_AUTO" "$POLIZA_VIDA"; do
+    nombre18="$(basename "$extra")"
+    if [ ! -f "$extra" ]; then
+      bad "falta el PDF del set: $extra"
+      continue
+    fi
+    codigo18="$(curl -sS -o "$SMOKE_TMP/alta18.json" -w '%{http_code}' --max-time 30 \
+                 -F "file=@$extra;type=application/pdf" \
+                 "$API_URL/api/documents" 2>/dev/null || echo 000)"
+    estado18=""
+    if [ "$codigo18" = "201" ] || [ "$codigo18" = "200" ]; then
+      id18="$(jstr id "$SMOKE_TMP/alta18.json")"
+      j=0
+      while [ "$j" -lt 50 ]; do
+        j=$((j + 1))
+        rm -f "$SMOKE_TMP/detalle18.json"
+        curl -fsS --max-time 5 -o "$SMOKE_TMP/detalle18.json" \
+          "$API_URL/api/documents/$id18" 2>/dev/null || true
+        estado18="$(jstr status "$SMOKE_TMP/detalle18.json")"
+        [ "$estado18" = "ready" ] && break
+        sleep 2
+      done
+    fi
+    if [ "$estado18" = "ready" ]; then
+      ok "$nombre18 ingerida y ready (el runner la busca por sha256)"
+    else
+      bad "$nombre18: subida HTTP ${codigo18}, estado final '${estado18:-sin id}' — el runner la necesita"
+    fi
+  done
+
+  salida18="$(compose exec -T api python -m app.evaluation.runner </dev/null 2>&1 || true)"
+  printf '%s\n' "$salida18"
+
+  if printf '%s\n' "$salida18" | grep -q "EVAL resultado=OK"; then
+    ok "evaluación en verde: documento localizado, etiquetas verificadas, métricas calculadas"
+  else
+    fallo18="$(printf '%s\n' "$salida18" | grep -o 'EVAL fallo=.*' | head -1)"
+    bad "la evaluación no terminó en verde — ${fallo18:-sin líneas EVAL: ¿crash del runner? (ver reporte de arriba)}"
+  fi
+
+  hit5="$(printf '%s\n' "$salida18" | grep -oE 'EVAL hit5=[0-9]+/[0-9]+' | head -1 | cut -d= -f2)"
+  if [ -n "$hit5" ] && [ "${hit5%%/*}" = "${hit5##*/}" ]; then
+    ok "hit@5 = ${hit5}: toda pregunta en dominio encuentra su evidencia en los top-5"
+  else
+    bad "hit@5 = '${hit5}' — hay preguntas cuya evidencia no aparece en los top-5"
+  fi
+
+  fuera18="$(printf '%s\n' "$salida18" | grep -oE 'EVAL fuera_dominio_aceptados=[0-9]+/[0-9]+' | head -1 | cut -d= -f2)"
+  if [ -n "$fuera18" ] && [ "${fuera18%%/*}" = "0" ]; then
+    ok "fuera de dominio: ${fuera18} aceptados al umbral configurado (D13)"
+  else
+    bad "fuera de dominio: '${fuera18}' aceptados — el umbral dejaría colar preguntas sin evidencia"
+  fi
+fi
+
 echo ""
 echo "=================================================="
 echo " RESULTADO: $PASS OK / $FAIL FALLOS"
 if [ "$FAIL" -eq 0 ]; then
-  echo " SMOKE: TODO VERDE — Fase 5 (trazas OTLP) verificada end-to-end"
+  echo " SMOKE: TODO VERDE — Fase 5 verificada end-to-end (trazas OTLP + evaluación con las tres pólizas)"
 else
   echo " SMOKE: hay fallos — revisar la lista de arriba"
 fi

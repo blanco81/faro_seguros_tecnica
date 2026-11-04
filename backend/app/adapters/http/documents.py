@@ -15,6 +15,15 @@ Contrato:
   primero, orden del repositorio).
 - ``GET /api/documents/{document_id}`` — detalle: estado, páginas, chunks,
   motivo de fallo (el polling de la Fase 4 lee esto).
+- ``DELETE /api/documents/{document_id}`` — elimina el documento y, en
+  cascada, sus chunks y su contenido (D30). ``204`` borrado; ``404`` si
+  no existe; ``409`` si sigue ``pending``/``processing`` (la tarea en
+  vuelo escribiría contra filas que ya no están — se reintenta cuando
+  la ingesta llegue a ``ready``/``failed``). El UNIQUE de ``content_hash``
+  (D03) queda libre: re-subir los mismos bytes registra de nuevo.
+  Es también el mecanismo de auto-limpieza del smoke (sección 17).
+- ``GET /api/documents/{document_id}/content`` — el PDF original para la
+  cita navegable (ver abajo).
 
 La pieza no obvia — **orden commit → dispatch**: la tarea Celery se
 despacha SOLO después de que el commit persistió el documento. Se verificó
@@ -249,3 +258,53 @@ def get_document_content(
             "Cache-Control": "public, max-age=3600",
         },
     )
+
+
+@documents_router.delete("/{document_id}", status_code=204)
+def delete_document(
+    document_id: uuid.UUID,
+    repository_uow: Callable[[], AbstractContextManager[DocumentRepository]] = Depends(
+        get_repository_uow
+    ),
+) -> None:
+    """Elimina un documento con todo lo que arrastra (D30).
+
+    Un ``DELETE`` del documento tumba chunks y contenido por la FK
+    ``ON DELETE CASCADE`` del esquema — sin estado parcial. La puerta de
+    entrada es el estado: mientras la ingesta esté en vuelo
+    (``pending``/``processing``) el borrado se rechaza con ``409``, porque
+    la tarea del worker insertaría chunks contra un documento que ya no
+    existe y moriría en FK (ruido en reintentos y trazas, D04). En
+    ``ready`` y ``failed`` se puede borrar — un ``failed`` es justo la
+    subida rota que se quiere limpiar y re-subir.
+
+    Status codes:
+
+    - ``204``: eliminado (documento, chunks y contenido).
+    - ``404``: el documento no existe (o se esfumó entre el GET y el
+      DELETE — el ``delete`` del repositorio lo detecta).
+    - ``409``: está ``pending``/``processing``; reintentar cuando la
+      ingesta termine.
+    """
+    with repository_uow() as repository:
+        document = repository.get(document_id)
+        if document is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Documento no encontrado: {document_id}",
+            )
+        if document.status in (DocumentStatus.PENDING, DocumentStatus.PROCESSING):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"El documento '{document.filename}' está en ingesta "
+                    f"({document.status.value}): espera a que termine para "
+                    "borrarlo."
+                ),
+            )
+        if not repository.delete(document_id):
+            # Desapareció entre el GET y el DELETE (borrado concurrente).
+            raise HTTPException(
+                status_code=404,
+                detail=f"Documento no encontrado: {document_id}",
+            )

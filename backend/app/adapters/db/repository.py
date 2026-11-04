@@ -10,6 +10,9 @@ PostgreSQL — los cubre el smoke test del stack real, Fase 2 paso 5):
   la sesión inyectada. Quien abre la sesión (request HTTP o tarea
   Celery) decide el commit: un fallo intermedio no deja estado parcial
   (D03).
+- **``delete``**: UN ``DELETE`` del documento; chunks y contenido
+  caen por la FK ``ON DELETE CASCADE`` de la base (D30) — el smoke
+  verifica esa cascada contra PostgreSQL de verdad.
 - **El enum viaja por valor** (``values_callable``, migración 0001):
   lo que se lee de la base es un ``DocumentStatus`` del dominio, no un
   string suelto.
@@ -92,6 +95,21 @@ class SqlAlchemyDocumentRepository:
         )
         self._session.flush()
         return len(ordenados)
+
+    def delete(self, document_id: uuid.UUID) -> bool:
+        """Un solo ``DELETE FROM documents`` — el resto cae por FK CASCADE.
+
+        Los chunks y el contenido no se tocan aquí: la FK
+        ``ON DELETE CASCADE`` del esquema (migraciones 0001/0002) los
+        tumba en la misma sentencia, sin N consultas ni estado parcial
+        (D30). Lo que la suite no puede probar sin PostgreSQL — que la
+        cascada de verdad dispare en la base real — lo cubre el smoke
+        (sección 17: 0 chunks del documento tras el borrado).
+        """
+        resultado = self._session.execute(
+            delete(Document).where(Document.id == document_id)
+        )
+        return bool(resultado.rowcount)
 
     def save_content(self, document_id: uuid.UUID, data: bytes) -> None:
         if self._session.get(Document, document_id) is None:
