@@ -96,7 +96,7 @@ echo "=================================================="
 
 echo ""
 echo "1) Servicios corriendo"
-for svc in db redis api worker frontend otel-collector; do
+for svc in db redis api worker frontend otel-collector jaeger; do
   cid="$(compose ps -q "$svc" 2>/dev/null)"
   if [ -z "$cid" ]; then bad "$svc: no existe"; continue; fi
   estado="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)"
@@ -474,11 +474,129 @@ if [ "$estado_final" = "ready" ]; then
   fi
 fi
 
+# Sección 17 — Fase 5 (D23/D24): trazas OTLP en el collector.
+# Para verificar de verdad la propagación HTTP → Celery hace falta una tarea
+# DESPACHADA en esta corrida. La subida de la póliza (sección 10) es
+# idempotente (D03): en un stack caliente responde 200 y NO despacha nada
+# → no habría spans nuevos. Por eso esta sección sube un .txt de contenido
+# ÚNICO (siempre 201 → tarea nueva, text/plain permitido por D08) y espera
+# a que termine antes de inspeccionar los logs del collector.
+#
+# El exporter debug del collector (verbosity: detailed) imprime cada span
+# con su service.name y su Trace ID. Con la instrumentación aplicada:
+#   - faro-api    emite apply_async/tasks.ingest_document (publicación) + HTTP
+#   - faro-worker emite run/tasks.ingest_document (ejecución, en el hijo prefork)
+#   - y la prueba de la propagación (paso 3): ambos comparten Trace ID.
+echo ""
+echo "17) Trazas OTLP en el collector (Fase 5, D23/D24)"
+
+# Sonda: .txt único para forzar una tarea fresca (D08 admite text/plain).
+printf 'Smoke de telemetría OTel — ejecución %s\n' "$(date +%s%N)" \
+  > "$SMOKE_TMP/sonda.txt"
+codigo_sonda="$(curl -sS -o "$SMOKE_TMP/sonda.json" -w '%{http_code}' \
+  --max-time 30 -F "file=@$SMOKE_TMP/sonda.txt;type=text/plain" \
+  "$API_URL/api/documents" 2>/dev/null || echo 000)"
+sonda_id="$(jstr id "$SMOKE_TMP/sonda.json" 2>/dev/null)"
+if [ "$codigo_sonda" = "201" ] && [ -n "$sonda_id" ]; then
+  ok "sonda única despachada: HTTP 201 (tarea nueva, no idempotente)"
+else
+  bad "sonda única rechazada: HTTP $codigo_sonda — sin tarea nueva no hay trazas que verificar"
+fi
+
+# Esperar al desenlace de la sonda (worker + proveedor de embeddings).
+estado_sonda=""
+if [ -n "$sonda_id" ]; then
+  i=0
+  while [ "$i" -lt 40 ]; do
+    i=$((i + 1))
+    rm -f "$SMOKE_TMP/sonda_det.json"
+    curl -fsS --max-time 5 -o "$SMOKE_TMP/sonda_det.json" \
+      "$API_URL/api/documents/$sonda_id" 2>/dev/null || true
+    estado_sonda="$(jstr status "$SMOKE_TMP/sonda_det.json" 2>/dev/null)"
+    if [ "$estado_sonda" = "ready" ] || [ "$estado_sonda" = "failed" ]; then break; fi
+    sleep 2
+  done
+fi
+if [ "$estado_sonda" = "ready" ] || [ "$estado_sonda" = "failed" ]; then
+  ok "sonda terminó: $estado_sonda (el span run/ ya cerró)"
+else
+  bad "la sonda no terminó en ~80 s (último estado: '${estado_sonda:-sin respuesta}')"
+fi
+
+# Margen para el BatchSpanProcessor (lotes de hasta 5 s).
+sleep 5
+logs_col="$(compose logs --since 15m --no-color otel-collector 2>/dev/null || true)"
+
+if echo "$logs_col" | grep -q "faro-api"; then
+  ok "spans de faro-api en el collector (HTTP / LLM / publicación)"
+else
+  bad "sin spans de faro-api — ¿OTEL_ENABLED=false? (D23: el valor por defecto es true)"
+fi
+
+if echo "$logs_col" | grep -q "faro-worker"; then
+  ok "spans de faro-worker en el collector (ingesta en el hijo prefork)"
+else
+  bad "sin spans de faro-worker — la instrumentación va en worker_process_init (cada hijo); si se aplica en worker_init el hilo del BSP no sobrevive al fork (D24)"
+fi
+
+if echo "$logs_col" | grep -q "tasks.ingest_document"; then
+  ok "span de la tarea de ingesta presente (apply_async/ o run/tasks.ingest_document)"
+else
+  bad "sin span tasks.ingest_document — instrumentación Celery (D23)"
+fi
+
+# Propagación: apply_async (faro-api) y run (faro-worker) con el MISMO
+# Trace ID. La librería nombra los spans como <op>/<tarea>: prefijo
+# apply_async/ para el productor, run/ para el consumidor (D24).
+tids_de_span() {
+  # uso: tids_de_span <logs> <nombre_span> -> un Trace ID por línea
+  printf '%s\n' "$1" | awk -v nombre="$2" '
+    /Trace ID[ ]*:/ { sub(/.*:[[:space:]]*/, ""); tid = $0 }
+    $0 ~ ("Name[ ]*: " nombre) { if (tid != "") print tid }
+  '
+}
+tids_pub="$(tids_de_span "$logs_col" 'apply_async/tasks.ingest_document')"
+tids_run="$(tids_de_span "$logs_col" 'run/tasks.ingest_document')"
+compartido="$(comm -12 <(printf '%s\n' "$tids_pub" | sort -u) \
+                     <(printf '%s\n' "$tids_run" | sort -u))"
+if [ -n "$compartido" ]; then
+  ok "propagación HTTP → Celery: apply_async y run comparten trace ID"
+else
+  bad "apply_async y run no comparten trace ID — revisar inyección/extracción de cabeceras (D23)"
+fi
+
+# Jaeger (D25): el collector le reenvía las trazas por OTLP. La UI está en
+# http://localhost:16686; aquí se consulta su API REST para confirmar que
+# recibió los servicios y una traza que cruza faro-api <-> faro-worker.
+jaeger_api="http://localhost:16686"
+esperar_jaeger=0
+servicios_jaeger=""
+while [ "$esperar_jaeger" -lt 30 ]; do
+  servicios_jaeger="$(curl -fsS --max-time 5 "$jaeger_api/api/services" 2>/dev/null || true)"
+  if echo "$servicios_jaeger" | grep -q "faro-api"; then break; fi
+  sleep 2
+  esperar_jaeger=$((esperar_jaeger + 2))
+done
+if echo "$servicios_jaeger" | grep -q "faro-api" && echo "$servicios_jaeger" | grep -q "faro-worker"; then
+  ok "Jaeger /api/services lista faro-api y faro-worker (collector -> Jaeger OK, D25)"
+else
+  bad "Jaeger sin faro-api/faro-worker en /api/services — ¿exporter otlp/jaeger en el collector? (D25)"
+fi
+
+# Una traza que cruza ambos servicios (la propagación, vista desde Jaeger).
+traza_cruzada="$(curl -fsS --max-time 5 \
+  "$jaeger_api/api/traces?service=faro-api&limit=20" 2>/dev/null || true)"
+if echo "$traza_cruzada" | grep -q "faro-worker"; then
+  ok "Jaeger tiene una traza faro-api <-> faro-worker (waterfall en http://localhost:16686)"
+else
+  bad "Jaeger sin traza que cruce servicios — reenvía pero sin propagación visible (D25)"
+fi
+
 echo ""
 echo "=================================================="
 echo " RESULTADO: $PASS OK / $FAIL FALLOS"
 if [ "$FAIL" -eq 0 ]; then
-  echo " SMOKE: TODO VERDE — Fase 4 verificada end-to-end"
+  echo " SMOKE: TODO VERDE — Fase 5 (trazas OTLP) verificada end-to-end"
 else
   echo " SMOKE: hay fallos — revisar la lista de arriba"
 fi

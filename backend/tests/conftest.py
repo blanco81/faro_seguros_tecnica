@@ -18,3 +18,9 @@ os.environ["EMBEDDING_PROVIDER"] = "fake"
 # memoria: parsea sin driver, no conecta nunca y grita si alguien olvida
 # sobrescribir la dependencia real.
 os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
+
+# Fase 5 (D23): sin collector en la suite — la instrumentación OTel debe
+# quedarse en no-op (setup_telemetry devuelve None y create_app no toca
+# la app). Los tests de telemetría usan providers EXPLÍCITOS que nunca
+# pasan por el global, así que esto solo blindaría un create_app real.
+os.environ["OTEL_ENABLED"] = "false"

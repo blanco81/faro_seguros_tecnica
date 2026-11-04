@@ -9,14 +9,19 @@ responder** en lugar de inventar.
 > Prueba técnica TopDevCrew · Ingeniero AI Full Stack Semi-Senior
 > Entrega antes del **5 de noviembre de 2026, 23:22 UTC**
 
-**Estado: Fase 4/6 verificada** — Fase 0–3 (infra, dominio, ingesta asíncrona,
-consulta agéntica) y Fase 4 cerrada: **frontend React+Vite** con subida
-drag&drop, listado con polling 3s, consulta al agente con tres desenlaces
-(respuesta / rechazo / aclaración) y **citas navegables** — cada cita abre el
-PDF original en pestaña nueva con `#page=N` (D12). Endpoint nuevo
-`GET /api/documents/{id}/content` sirve el PDF `inline` y cacheable (D03).
-172 tests unitarios, 16 secciones de smoke. Siguiente: Fase 5 (observabilidad).
-Ver [cronograma](#cronograma).
+**Estado: Fase 5/6 en curso** — Fase 0–4 cerradas (infra, dominio, ingesta
+asíncrona, consulta agéntica, frontend con citas navegables). Fase 5
+(observabilidad + seguridad) arrancada: **trazas OpenTelemetry end-to-end**
+(D23, con los tres bugs de la primera corrida real corregidos en D24:
+worker instrumenta en `worker_process_init` para sobrevivir al fork prefork,
+el smoke fuerza tarea fresca con sonda única, nombres de span reales) y
+**Jaeger always-on** (D25: el collector reenvía las trazas a Jaeger, UI en
+http://localhost:16686) — una sola traza cruza `POST /api/documents`
+(faro-api) → tarea Celery (faro-worker) → llamadas LLM/embeddings, con
+propagación de contexto HTTP → Celery verificada por trace ID. 183 tests
+unitarios; smoke end-to-end **17 secciones** (la 17 comprueba las trazas en
+el collector Y en Jaeger). Pendiente en Fase 5: spans de dominio RAG,
+precision@k/recall@k y aislamiento del prompt (D08). Ver [cronograma](#cronograma).
 
 ## Stack
 
@@ -61,7 +66,7 @@ D13/D19) y, desde la Fase 4, el **frontend y la cita navegable**
 
 ```bash
 make up      # levanta el stack
-make smoke   # 16 secciones / ~40 comprobaciones individuales, PASS/FAIL por cada una
+make smoke   # 16 secciones / 40 comprobaciones, PASS/FAIL por cada una
 ```
 
 Si el stack se deployó desde Portainer con otro nombre de proyecto:
@@ -168,8 +173,20 @@ La regla de dependencias es hexagonal: `domain` y `services` no importan nada de
 - [x] **Fase 1** — Dominio puro: chunking, umbral de rechazo, citas + tests unitarios
 - [x] **Fase 2** — Ingesta asíncrona: puertos y adapters, Celery idempotente, retries, API de subida/seguimiento
 - [x] **Fase 3** — Consulta RAG agéntica: recuperación pgvector, bucle con verificación de citas (D19), rechazo explícito (D13) — **verificada con `make smoke` 37/37 OK, umbral calibrado en 0.45 (D20)**
-- [x] **Fase 4** — Frontend React+Vite: subida drag&drop, listado con polling 3s, consulta con tres desenlaces, citas navegables (`#page=N`, D12) — **verificada con `make smoke` (sección 16)**
+- [x] **Fase 4** — Frontend React+Vite: subida drag&drop, listado con polling 3s, consulta con tres desenlaces, citas navegables (`#page=N`, D12) — **verificada con `make smoke` 40/40 OK**
 - [ ] **Fase 5** — Observabilidad end-to-end (HTTP → Celery → LLM) + seguridad
+  - [x] Pasos 1-3 (D23 + D24): telemetría real — `app/telemetry` instrumenta FastAPI +
+    Celery + httpx en ambos procesos, propagación HTTP → Celery por traceparent,
+    sección 17 del smoke. Bug del compose corregido (worker heredaba un
+    endpoint OTLP inalcanzable desde `network_mode: host`) y tres bugs más
+    destapados por la primera corrida real (D24): instrumentación en
+    `worker_process_init` (cada hijo prefork, no el padre — el hilo del BSP
+    no sobrevive al fork), sonda única en el smoke para forzar tarea fresca
+    (D03 idempotencia) y nombres de span reales (`apply_async/` y `run/`)
+  - [ ] Spans de dominio RAG (score vs umbral por iteración, desenlaces)
+  - [ ] Métricas precision@k / recall@k (D20) y curva ROC
+  - [x] **Jaeger always-on** (D25): el collector reenvía trazas a Jaeger por OTLP (`otlp/jaeger` en `infra/otel-collector-config.yaml`) y el servicio `jaeger` perdió el `profiles: ["ui"]` — arranca con `make up` y su UI en http://localhost:16686 muestra la cascada faro-api ↔ faro-worker; el smoke consulta su API REST (`/api/services`, `/api/traces`)
+  - [ ] Aislamiento del contexto no confiable en el prompt (D08)
 - [ ] **Fase 6** — README completo, DECISIONS.md final, documentos y preguntas de evaluación
 
 Decisiones de diseño, alternativas descartadas y uso de IA generativa:

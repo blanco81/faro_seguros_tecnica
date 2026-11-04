@@ -100,6 +100,11 @@ services:
       <<: *backend-env
       DATABASE_URL: postgresql+psycopg://faro:faro@localhost:5432/faro
       REDIS_URL: redis://localhost:6379/0
+      # Fase 5 (D21): igual que la api, este servicio usa network_mode: host
+      # y 'otel-collector' NO resuelve por DNS ahí — el anchor heredaría un
+      # endpoint muerto y las trazas del worker se perderían en silencio.
+      # El collector mapea 4318 al host: localhost funciona desde aquí.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
     depends_on:
       db:
         condition: service_healthy
@@ -138,7 +143,9 @@ services:
     networks:
       - intergraf_net
 
-  # Opcional: UI de trazas para la demo de la entrevista
+  # Jaeger all-in-one: UI de trazas en http://localhost:16686. D25: arranca
+  # con el resto (antes iba con --profile ui). El collector le reenvía las
+  # trazas por OTLP (exporter otlp/jaeger en infra/otel-collector-config.yaml).
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
     environment:
@@ -147,7 +154,6 @@ services:
       - "16686:16686"
     networks:
       - intergraf_net
-    profiles: ["ui"]
 
 volumes:
   pgdata:

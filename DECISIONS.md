@@ -512,6 +512,206 @@ no abriría el visor y `#page=N` no tendría efecto — por eso `inline`.
 directamente): rompería el contrato del dominio (D12) donde la cita es
 "documento, página, fragmento" legible por un humano, no un UUID.
 
+## D22 — El smoke inspecciona cabeceras con el propio GET (`curl -D`), nunca con HEAD
+
+**Contexto.** Al cerrar la Fase 4, el smoke 16c reportaba
+`GET /content -> 200 pero headers malos (ct='application/json', cd='')`
+para `GET /api/documents/{id}/content`, mientras el `curl` manual al mismo
+URL devolvía el PDF binario y los 4 tests del endpoint (MIME, `inline`,
+cacheable, 404) estaban verdes. Tres fuentes de verdad con dos diciendo
+"bien" y una diciendo "mal" — la tercera era la del smoke.
+
+**Decisión.** Diagnóstico reproducido antes de tocar nada: el smoke extraía
+las cabeceras con `curl -I`, que envía **HEAD**, y FastAPI no registra HEAD
+en rutas GET (`APIRoute` no lo añade — a diferencia de Starlette puro, que
+sí lo hace). El endpoint contestaba `405 Method Not Allowed` con cuerpo
+JSON, y el smoke leía el `content-type` **de esa respuesta de error**, no
+del endpoint. Fix en el smoke: un único GET con `-D <fichero>` volcando las
+cabeceras (el mismo patrón de la sección 10 con `alta.headers`) — cuerpo y
+cabeceras salen de la misma respuesta — más verificación de magic bytes
+(`%PDF`): la cita solo es navegable si lo que se sirve es de verdad un PDF.
+Validación: FastAPI 0.128 con el endpoint replicado mostró GET → 200
+`application/pdf` `inline` y HEAD → 405 `application/json`; la lógica vieja
+del smoke reprodujo el fallo carácter por carácter contra un uvicorn real y
+la nueva pasó (40/40 OK en el stack). Regla para el resto del proyecto:
+inspeccionar cabeceras de endpoints FastAPI con el propio GET (`curl -D`),
+nunca pidiendo un HEAD que el framework no sirve.
+
+**Alternativas descartadas.** Registrar HEAD en el endpoint
+(`methods=["GET", "HEAD"]`): arregla el síntoma, pero ningún consumidor real
+manda HEAD a `/content` (el visor del navegador abre con GET) — el chequeo
+debe pedir exactamente lo que dice verificar. Dos curl separados (uno para
+el cuerpo, otro para las cabeceras): duplica peticiones y abre la puerta a
+que lo comprobado y lo descargado diverjan; `-D` garantía de que son la
+misma respuesta.
+
+## D23 — Observabilidad Fase 5 (pasos 1-3): un módulo de telemetría, dos procesos, propagación HTTP → Celery
+
+**Contexto.** La Fase 5 pide observabilidad end-to-end (HTTP → Celery →
+LLM). Las dependencias (`opentelemetry-*`, incluidas las instrumentaciones
+de FastAPI/Celery/httpx), el servicio `otel-collector` y las variables
+`OTEL_ENABLED`/`OTEL_EXPORTER_OTLP_ENDPOINT` existían desde fases
+anteriores — pero `app/telemetry/` estaba vacío: nada instrumentaba nada.
+El objetivo de estos primeros pasos es que una sola traza cruce el stack:
+`POST /api/documents` (span HTTP en faro-api) → publicación de la tarea
+(span productor) → `tasks.ingest_document/run` (span en faro-worker) →
+llamadas de embeddings (span httpx), y lo mismo por el camino de la
+consulta (`POST /api/query` → bucle agéntico → LLM).
+
+**Decisión.** Un único módulo `app/telemetry/setup.py` con tres piezas:
+
+1. **`setup_telemetry(service_name)`** monta el TracerProvider del
+   proceso (OTLP/HTTP + `BatchSpanProcessor`). Idempotente (guard de
+   módulo: `set_tracer_provider` es una vez por proceso y `main.py`
+   crea la app a nivel de módulo Y bajo demanda) y desactivable:
+   `OTEL_ENABLED=false` → `None` y cero efectos (así hermetiza la suite
+   la variable del conftest, igual que `LLM_PROVIDER=fake`).
+2. **`instrument_api` / `instrument_worker`**: qué instrumenta cada
+   proceso. La API también es PRODUCTOR de tareas Celery, así que
+   instrumenta FastAPI + Celery + httpx (LLM); el worker instrumenta
+   Celery + httpx (embeddings). `service.name` distingue `faro-api` de
+   `faro-worker` en Jaeger. Los instrumentores de librería se aplican
+   una vez por proceso (set de guard): son parches de clase y repetirlos
+   solo genera avisos.
+3. **Propagación HTTP → Celery**: la instrumentación de Celery inyecta
+   el contexto (cabeceras `traceparent`) al publicar y lo extrae al
+   ejecutar — `run` queda como hijo de `publish`. El hook del worker va
+   en la señal `worker_init` (nunca en el import): así la suite y el
+   proceso API, que importan `celery_app`, no instrumentan nada.
+
+Dos hallazgos de implementación que quedan como regla:
+
+- **El exporter OTLP/HTTP del SDK NO añade `/v1/traces`** a un endpoint
+  sin ruta: exporta a `/` y el collector lo rechaza en silencio.
+  `normalizar_endpoint_otlp` lo añade (verificado contra un receptor
+  real antes de escribir el código, no contra la documentación).
+- **El worker heredaba del anchor `http://otel-collector:4318`**, un DNS
+  que no resuelve desde `network_mode: host` — sus trazas se habrían
+  perdido sin error visible. El compose ahora fija `localhost:4318`
+  para api Y worker (el collector mapea 4318 al host).
+
+**Verificación.** Tres niveles: (a) unitaria — `tests/test_telemetry.py`
+(8 tests: normalización del endpoint, no-op desactivado, idempotencia,
+span HTTP con ruta plantilla, service.name en el Resource) con providers
+explícitos que nunca tocan el global; suite completa 180/180;
+(b) local sin Docker — `scripts/verifica_telemetria_local.py` arranca un
+receptor OTLP real y comprueba export, spans HTTP/httpx, inyección de
+`traceparent` en el mensaje Celery (broker `memory://`) y span `run`
+(8/8 OK); (c) el smoke, nueva sección 17: spans de `faro-api` y
+`faro-worker` en los logs del collector y — la prueba de la propagación
+— `publish` y `run` compartiendo Trace ID (intersección de los IDs de
+los últimos 15 min, tolerante a re-ejecuciones del propio smoke).
+
+**Alternativas descartadas.** Instrumentar en el import de
+`celery_app.py`: activaría la instrumentación en tests y en la API (que
+no ejecuta tareas) solo por importar el módulo. `OTEL_SERVICE_NAME`
+como setting: los nombres de servicio son constantes de despliegue, no
+perillas — mismo criterio de "sin teclas sin evidencia" que D16.
+Instrumentación en cada adapter (llm/embeddings) a mano: los parches de
+httpx cubren el SDK de OpenAI completo (que corre sobre httpx) sin
+tocar los adapters. Span de dominio (scores, iteraciones del agente):
+siguiente paso de la Fase 5 — primero la espina dorsal, luego la
+instrumentación con semántica de negocio.
+
+**Pendiente de la Fase 5.** Spans de dominio RAG (score vs umbral por
+iteración, desenlaces), métricas precision@k/recall@k (D20), perfil
+`ui` con Jaeger ya presente en el compose (falta el exportador
+collector → Jaeger en `infra/otel-collector-config.yaml`), y el
+aislamiento del contexto no confiable en el prompt (D08).
+
+## D24 — Tres bugs destapados por la primera corrida real del smoke de la Fase 5
+
+**Contexto.** D23 entregó la instrumentación y la sección 17 del smoke, pero
+la primera ejecución contra el stack de verdad dio 41 OK / 3 FAIL: spans de
+`faro-api` presentes, pero ni `faro-worker` ni la tarea `tasks.ingest_document`
+ni la propagación (trace ID compartido). Tres bugs independientes, los tres
+silenciosos hasta correr el sistema real.
+
+**Bug 1 — el smoke asumía una ingesta fresca que no ocurría.** La subida de la
+póliza (sección 10) es idempotente por diseño (D03): en un stack donde el PDF
+ya estaba registrado, `POST /api/documents` responde **200 y no despacha
+tarea nueva**. Sin tarea despachada en esta corrida no hay spans de Celery que
+verificar → checks 2-4 fallaban por construction. **Fix:** la sección 17 sube
+ahora un `.txt` de contenido único (un `date +%s%N` en el cuerpo) → siempre
+201 → tarea despachada → spans reales; `text/plain` está admitido por la
+validación (D08) y la extracción (`PlainTextExtractor`). La sonda no toca los
+documentos de las secciones 10-16 (distinto `doc_id`).
+
+**Bug 2 — instrumentar el worker en `worker_init` (padre) pierde los spans en
+prefork.** El compose arranca `celery worker --concurrency=2` (pool **prefork**,
+el default en Linux): `worker_init` se emite en el **padre**, que luego
+`fork()`a los hijos. La instrumentación conectaba los signal receivers y
+montaba el `TracerProvider`+`BatchSpanProcessor` en el padre; los hijos
+heredan el provider, pero **`fork()` no copia hilos** → el hilo exportador del
+BSP no existe en el hijo → los spans del `run` se acumulan en una cola muerta
+y **nunca se exportan**, sin error visible. **Fix:** enganchar la
+instrumentación en `worker_process_init` (señal que se emite en **cada hijo**
+del pool al arrancar): cada hijo monta un provider fresco con su propio hilo
+exportador vivo. Es el patrón documentado por `opentelemetry-instrumentation-celery`.
+El padre queda sin instrumentar (con prefork no ejecuta tareas). Pinned por
+`test_worker_se_instrumenta_en_cada_hijo_prefork`.
+
+**Bug 3 — nombres de span invertidos en el check de propagación.** La
+instrumentación nombra los spans como `<operación>/<tarea>` (prefijo, ver
+fuente): `apply_async/tasks.ingest_document` (productor) y
+`run/tasks.ingest_document` (consumidor). El smoke grepaba
+`tasks.ingest_document/publish` y `.../run` (sufijo) → **esos nombres no
+existen nunca** → el `comm -12` de trace IDs daba siempre vacío → el check 4
+fallaba aunque todo funcionara. **Fix:** grep de los nombres reales.
+
+**Alternativas descartadas.** (b1) Subir de nuevo la póliza tras borrar sus
+filas por SQL: cirugía de la tabla desde un script de monitorización — la
+sonda única es más simple y no muta documentos reales. (b2) `--pool=solo`:
+evitaría el fork, pero cambia la semántica de concurrencia del worker de
+producción. (b3) `SimpleSpanProcessor` (export síncrono, sin hilo): fork-safe,
+pero añade una llamada HTTP síncrona por span dentro de la tarea. (b4)
+`os.register_at_fork` reseteando el provider global del SDK: requiere tocar
+API privada de `opentelemetry.trace` (`_TRACER_PROVIDER`), frágil entre
+versiones. `worker_process_init` es la solución canónica y la más limpia.
+
+**Verificación.** Suite 181/181 (nuevo test de wiring de la señal); verificación
+local `scripts/verifica_telemetria_local.py` 8/8 (productor + eager); smoke
+sección 17 reescrita con sonda única y nombres reales — el `make smoke` contra
+el stack es la prueba canónica end-to-end.
+
+## D25 — Jaeger always-on + exporter collector → Jaeger (cierra el paso 5 de la Fase 5)
+
+**Contexto.** D23 dejó Jaeger en el compose como servicio opt-in
+(`profiles: ["ui"]`) y sin exporter en el collector: arrancaba solo bajo
+demanda y, aun arrancado, no recibía nada (el collector solo exportaba a
+`debug`). Era el «paso 5» pendiente de la Fase 5. Cerrarlo significa que
+Jaeger arranque con el resto y reciba trazas de verdad, con verificación
+automatizada de que las recibe.
+
+**Decisión.** Dos cambios mínimos:
+
+1. `infra/otel-collector-config.yaml`: nuevo exporter `otlp/jaeger`
+   (endpoint `jaeger:4317`, `tls.insecure: true`) añadido al pipeline de
+   trazas junto al `debug`. Collector y Jaeger comparten la red
+   `intergraf_net`, así que el DNS `jaeger` resuelve desde el collector sin
+   exponer más puertos al host.
+2. `docker-compose.yml`: quitado `profiles: ["ui"]` del servicio `jaeger` —
+   ahora arranca con `docker compose up` (`make up`) como los demás, y la
+   sección 1 del smoke lo verifica como uno más de la lista de servicios.
+
+**Verificación.** Smoke sección 17 +2 checks nuevos contra la API REST de
+Jaeger (`/api/services` lista `faro-api` y `faro-worker`; `/api/traces?service=faro-api`
+contiene `faro-worker` = una traza que cruza servicios, la propagación vista
+desde Jaeger) → 48/48 esperados. Suite 183/183 (pin del YAML del collector y
+de la ausencia de `profiles` en el compose). La UI en
+http://localhost:16686 muestra la cascada HTTP → `apply_async/tasks.ingest_document`
+→ `run/tasks.ingest_document` → httpx de embeddings, con el anidamiento
+padre↔hijo entre los dos servicios.
+
+**Alternativas descartadas.** Mantener Jaeger opt-in y solo añadir el
+exporter: arrancar `--profile ui` para ver trazas es fricción innecesaria en
+una demo de entrevista — el coste de Jaeger all-in-one (RAM) es asumible en
+este stack y la verificación automatizada lo justifica. Exponer 4317/4318 de
+Jaeger al host: innecesario, el collector habla con Jaeger por la red interna
+`intergraf_net`. `depends_on` del collector → Jaeger: el exporter OTLP del
+collector reintenta conexiones con backoff, así que no hace falta forzar el
+orden de arranque (y así un Jaeger caído no tira el collector ni el smoke).
+
 ## Uso de IA generativa
 
 Metodología: análisis del enunciado y planificación con IA; generación asistida
